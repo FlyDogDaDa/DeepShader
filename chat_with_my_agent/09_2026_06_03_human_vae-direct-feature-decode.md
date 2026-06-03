@@ -57,7 +57,10 @@ tags: [daily-log, architecture, dino-v3, vae, latent, pipeline]
 
 ## Follow-up
 
-- **驗證假設**：DINOv3 patch tokens 是否真的能直接映射到 latent？需要快速 PoC（ViT-S patch tokens → 輕量 MLP → VAE decode）
+- **✅ VAE roundtrip 已驗證**：`[1, 3, 512, 512]` → encode → `[1, 16, 64, 64]` → decode → `[1, 3, 512, 512]` 正常
+- **⏳ DINOv3 gated access 申請中**：`facebook/dinov3-vits16-pretrain-lvd1689m`
+- **✅ DINOv3 訪問已通過！**
+- 完整 PoC（DINOv3 → 隨機投影 → VAE decode）等 DINOv3 通過後執行
 - 選擇 DINOv3 模型（S/B/L 取決於特徵維度與計算成本）
 - 設計特徵↔Latent 映射網路的架構（patch grid → latent grid spatial 2x upsampling + channel 降維 384→16）
 - 評估硬體的 VRAM 是否足以執行這個 pipeline
