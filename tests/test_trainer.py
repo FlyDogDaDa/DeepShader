@@ -16,7 +16,8 @@ def test_config_defaults() -> None:
     assert config.lr > 0
     assert config.epochs > 0
     assert config.batch_size > 0
-    assert config.checkpoint_dir is None
+    assert config.output_dir is not None
+    assert config.dataset == ""
 
 
 def test_config_custom() -> None:

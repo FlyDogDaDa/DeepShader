@@ -219,3 +219,6 @@ __marimo__/
 
 # Agent / AI tooling
 .agents/
+
+# Runs
+runs/
