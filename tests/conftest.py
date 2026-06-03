@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import hashlib
-import tempfile
+import shutil
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from src.utility import scan_dataset, train_val_test_split
+
+# ── Cache cleanup ─────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clean_cache() -> None:
+    """Remove cached scan results before each test."""
+    cache = Path.cwd() / ".cache"
+    if cache.exists():
+        shutil.rmtree(cache)
 
 
 def _make_jpg(path: Path, size: tuple[int, int] = (512, 512)) -> Path:
@@ -51,7 +61,7 @@ def tmp_dataset_structure(tmp_path: Path) -> Path:
 @pytest.fixture()
 def small_paths(tmp_dataset_structure: Path) -> list[Path]:
     """Paths from the temp dataset (10 × 3 = 30 paths)."""
-    paths = scan_dataset(tmp_dataset_structure)
+    paths = scan_dataset(tmp_dataset_structure, use_cache=False)
     assert len(paths) == 30, f"Expected 30 paths, got {len(paths)}"
     return paths
 

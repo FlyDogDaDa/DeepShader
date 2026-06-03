@@ -25,7 +25,7 @@ def test_full_pipeline(tmp_path: Path) -> None:
             img = Image.new("RGB", (512, 512), color=(i * 3 % 255, 64, 200))
             img.save(d / f"{i:07d}.jpg", "JPEG")
 
-    paths = scan_dataset(base)
+    paths = scan_dataset(base, use_cache=False)
     assert len(paths) == 64
 
     # Single item

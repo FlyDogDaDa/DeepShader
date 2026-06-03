@@ -1,7 +1,7 @@
 ---
 created: 2026-06-03
-author: FlyDogDaDa
-type: human
+author: agent
+type: agent
 status: final
 tags: [daily-log, poc, dino-v3, vae, mapping, pipeline]
 ---

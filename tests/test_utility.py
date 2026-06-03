@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 from pathlib import Path
 
 import pytest
@@ -13,27 +15,71 @@ from src.utility import scan_dataset, train_val_test_split
 
 def test_scan_dataset_returns_paths(tmp_dataset_structure: Path) -> None:
     """scan_dataset() returns all .jpg files under the root."""
-    paths = scan_dataset(tmp_dataset_structure)
+    paths = scan_dataset(tmp_dataset_structure, use_cache=False)
     assert len(paths) == 30
 
 
 def test_scan_dataset_filter_by_subdir(tmp_dataset_structure: Path) -> None:
     """scan_dataset() with glob pattern returns matching files only."""
     sub = tmp_dataset_structure / "0000"
-    paths = scan_dataset(sub, pattern="*.jpg")
+    paths = scan_dataset(sub, pattern="*.jpg", use_cache=False)
     assert len(paths) == 10
 
 
 def test_scan_dataset_no_match_returns_empty(tmp_path: Path) -> None:
     """scan_dataset() on an empty dir returns []."""
-    paths = scan_dataset(tmp_path)
+    paths = scan_dataset(tmp_path, use_cache=False)
     assert paths == []
 
 
 def test_scan_dataset_pattern(tmp_dataset_structure: Path) -> None:
     """scan_dataset() accepts custom glob patterns."""
-    paths = scan_dataset(tmp_dataset_structure, pattern="0000/**/*.jpg")
+    paths = scan_dataset(
+        tmp_dataset_structure, pattern="0000/**/*.jpg", use_cache=False
+    )
     assert len(paths) == 10
+
+
+def test_scan_dataset_cache_hit(tmp_dataset_structure: Path) -> None:
+    """Second call with cache returns the same result without rescanning."""
+    cache_dir = Path.cwd() / ".cache"
+    cache_files = list(cache_dir.glob("*.pkl"))
+    n_before = len(cache_files)
+
+    first = scan_dataset(tmp_dataset_structure)
+    cache_files = list(cache_dir.glob("*.pkl"))
+    assert len(cache_files) == n_before + 1
+    assert len(first) == 30
+
+    second = scan_dataset(tmp_dataset_structure)
+    assert first == second
+
+    # Verify cache file was loaded (same object from pickle)
+    with cache_files[-1].open("rb") as f:
+        cached = pickle.load(f)
+    assert cached == first
+
+
+def test_scan_dataset_cache_different_patterns(tmp_dataset_structure: Path) -> None:
+    """Different patterns produce different cache files."""
+    cache_dir = Path.cwd() / ".cache"
+    n_before = len(list(cache_dir.glob("*.pkl")))
+
+    scan_dataset(tmp_dataset_structure, pattern="*.jpg", use_cache=True)
+    scan_dataset(tmp_dataset_structure, pattern="0000/**/*.jpg", use_cache=True)
+    cache_files = list(cache_dir.glob("*.pkl"))
+    assert len(cache_files) == n_before + 2
+
+
+def test_scan_dataset_cache_no_match_returns_empty(tmp_path: Path) -> None:
+    """scan_dataset() on an empty dir returns [] (cache empty list)."""
+    cache_dir = Path.cwd() / ".cache"
+    n_before = len(list(cache_dir.glob("*.pkl")))
+
+    paths = scan_dataset(tmp_path, use_cache=True)
+    assert paths == []
+    cache_files = list(cache_dir.glob("*.pkl"))
+    assert len(cache_files) == n_before + 1
 
 
 # ── train_val_test_split ──────────────────────────────────────────
