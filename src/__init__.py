@@ -5,7 +5,6 @@ from __future__ import annotations
 from src.dataset import (
     create_dataloaders,
     default_transform,
-    load_image,
 )
 from src.models import DinoToVAE_Linear, DinoToVAE_MLP
 from src.pretrains import DINO_MEAN, DINO_STD, DINOModel, VAEModel, load_dino, load_vae
@@ -24,7 +23,6 @@ __all__ = [
     # dataset
     "create_dataloaders",
     "default_transform",
-    "load_image",
     # pretrains
     "load_vae",
     "load_dino",

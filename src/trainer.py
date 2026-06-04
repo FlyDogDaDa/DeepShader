@@ -66,6 +66,7 @@ class TrainingConfig:
     num_workers: int = 16
     warmup_steps: int = 1000
     max_steps: int = 0  # 0 = run all epochs
+    log_freq: int = 100  # log every N training steps
     val_freq: int = 5  # validate every N epochs
     val_ratio: float = 0.1  # fraction for validation set
     sample_images: int = 4  # decode N samples every val step
@@ -153,6 +154,9 @@ def train_epoch(
     vae: VAEModel,
     device: torch.device,
     debug: bool = False,
+    log_freq: int = 100,
+    logger: logging.Logger | None = None,
+    epoch: int = 0,
 ) -> float:
     """Run one training epoch. Returns mean loss."""
     mapper.train()
@@ -179,7 +183,8 @@ def train_epoch(
             print(f"[debug] pred_latents={pred_latents.shape}")
 
         # VAE → gt latents
-        gt_latents = vae.encode(images * 2 - 1)  # [B, 16, 64, 64]
+        with torch.no_grad():
+            gt_latents = vae.encode(images * 2 - 1)  # [B, 16, 64, 64]
 
         if debug:
             print(f"[debug] gt_latents={gt_latents.shape}")
@@ -192,6 +197,18 @@ def train_epoch(
 
         total_loss += loss.item() * images.shape[0]
         n_samples += images.shape[0]
+
+        # Log every N steps, and always on step 1
+        if (
+            logger is not None
+            and log_freq > 0
+            and ((batch_idx + 1) % log_freq == 0 or batch_idx == 0)
+        ):
+            global_step = epoch * len(loader) + batch_idx + 1
+            logger.info(
+                f"  step {global_step:,}  batch={batch_idx + 1}  "
+                f"loss={loss.item():.4f}  lr={optimizer.param_groups[0]['lr']:.6f}"
+            )
 
     return total_loss / n_samples
 
@@ -359,6 +376,9 @@ def run_training(
             vae,
             device,
             debug=config.debug,
+            log_freq=config.log_freq,
+            logger=logger,
+            epoch=epoch,
         )
         logger.info(f"Epoch {epoch + 1}/{config.epochs}  loss={train_loss:.4f}")
 

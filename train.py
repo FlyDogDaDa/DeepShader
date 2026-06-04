@@ -67,6 +67,9 @@ def parse_args() -> argparse.Namespace:
     )
     g.add_argument("--batch-size", type=int, default=8)
     g.add_argument("--num-workers", type=int, default=16)
+    g.add_argument(
+        "--prefetch", type=int, default=20, help="DataLoader prefetch_factor"
+    )
     g.add_argument("--val-ratio", type=float, default=0.1)
 
     # Model
@@ -86,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--epochs", type=int, default=100)
     g.add_argument("--lr", type=float, default=1e-3)
     g.add_argument("--warmup-steps", type=int, default=1000)
+    g.add_argument("--log-freq", type=int, default=100, help="Log every N steps")
     g.add_argument("--val-freq", type=int, default=5)
     g.add_argument(
         "--resume", type=str, default=None, help="Checkpoint path to resume from"
@@ -127,6 +131,7 @@ def main() -> None:
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         warmup_steps=args.warmup_steps,
+        log_freq=args.log_freq,
         val_freq=args.val_freq,
         output_dir=output_dir,
         mapper=args.mapper,
@@ -174,10 +179,12 @@ def main() -> None:
         return
 
     # ── Create DataLoaders ───────────────────────────────────────
+    # Create DataLoaders
     train_loader, val_loader, _ = create_dataloaders(
         all_paths,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
+        prefetch_factor=args.prefetch,
         train_ratio=0.9,
         val_ratio=config.val_ratio,
     )

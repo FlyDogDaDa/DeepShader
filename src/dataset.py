@@ -17,8 +17,15 @@ def load_image(path: Path) -> torch.Tensor:
 
 
 def default_transform() -> T.Transform:
-    """Return the default transform pipeline (no resize)."""
-    return T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
+    """Return the default transform pipeline (resize to 512, center crop to 512x512, augmentations)."""
+    return T.Compose(
+        [
+            T.Resize(512),
+            T.CenterCrop(512),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+        ]
+    )
 
 
 class ImageDataset:
@@ -62,9 +69,10 @@ def _make_loader(
     shuffle: bool,
     num_workers: int,
     drop_last: bool,
+    prefetch_factor: int = 20,
 ) -> DataLoader:
     """Create a DataLoader for *dataset* with shared defaults."""
-    prefetch = None if num_workers == 0 else 2
+    prefetch = None if num_workers == 0 else prefetch_factor
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -80,6 +88,7 @@ def create_dataloaders(
     *,
     batch_size: int = 64,
     num_workers: int = 16,
+    prefetch_factor: int = 20,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
@@ -119,6 +128,7 @@ def create_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         drop_last=True,
+        prefetch_factor=prefetch_factor,
     )
     val_loader = _make_loader(
         val_dataset,
@@ -126,6 +136,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         drop_last=False,
+        prefetch_factor=2,  # val doesn't need aggressive prefetch
     )
     test_loader = _make_loader(
         test_dataset,
