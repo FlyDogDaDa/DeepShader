@@ -222,3 +222,7 @@ __marimo__/
 
 # Runs
 runs/
+
+# Windows reserved device names
+nul
+NUL
