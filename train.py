@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Train DinoToVAE: DINOv3 patch tokens → FLUX VAE latents.
 
-Usage:
-    # Default (MLP mapper, 100 epochs)
-    uv run python -m train
+Two training modes:
+    Image mode (default): images → DINOv3 → mapper → VAE → latents
+    Cached mode:          patch_tokens + gt_latents from shard cache (faster)
 
-    # Custom output dir (default: runs/exp-YYYYMMDD_HHMMSS)
+Usage:
+    # Image mode (backward compatible, loads DINO + VAE each epoch)
     uv run python -m train --output runs/my-exp
+
+    # Cached mode (recommended: pre-encode with `python -m src.encode` first)
+    uv run python -m train --cache-dir ~/hdd/cache --output runs/cached-exp
 
     # Linear mapper, custom epochs
     uv run python -m train --mapper linear --epochs 50 --output runs/linear
@@ -14,7 +18,7 @@ Usage:
     # Resume from checkpoint
     uv run python -m train --output runs/my-exp --resume runs/my-exp/checkpoints/epoch_0020.pt
 
-    # Quick test on a tiny subset
+    # Quick debug run
     uv run python -m train --debug
 """
 
@@ -25,11 +29,14 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import torch
 from dotenv import load_dotenv
 
 from src import (
+    CachedDataset,
+    ShardCacheConfig,
     TrainingConfig,
     create_dataloaders,
     load_dino,
@@ -46,9 +53,77 @@ def _make_output_dir(base: str) -> str:
     base_path = Path(base)
     if base_path.exists():
         return base
-    # Generate timestamped name
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"{base}_{ts}"
+
+
+# ── Cached DataLoader factory ─────────────────────────────────────
+
+
+def _make_cached_dataloaders(
+    cache_dir: Path,
+    batch_size: int,
+    num_workers: int,
+    val_ratio: float,
+    shard_size: int = 1000,
+    seed: int = 42,
+) -> tuple[Any, Any, Any]:
+    """Create train/val DataLoaders from cached shards.
+
+    Uses index-range splitting for train/val split.
+    """
+    config = ShardCacheConfig(
+        cache_dir=cache_dir,
+        shard_size=shard_size,
+        max_cached_shards=8,
+    )
+    dataset = CachedDataset(config)
+    total = len(dataset)
+    n_train = int(total * (1 - val_ratio))
+    n_val = total - n_train
+
+    # Create a simple train sampler (sequential, no shuffle for now)
+    from torch.utils.data import DataLoader
+    from torch.utils.data.sampler import SubsetRandomSampler
+
+    train_indices = list(range(n_train))
+    val_indices = list(range(n_train, total))
+
+    # Shuffle train indices with seed
+    import random
+
+    rng = random.Random(seed)
+
+    rng.shuffle(train_indices)
+
+    # For train: use SubsetRandomSampler (shuffled)
+    # For val: use SequentialSampler (no shuffle)
+    from torch.utils.data.sampler import SequentialSampler
+
+    def _collate_fn(batch):
+        tokens = torch.stack([b[0].squeeze(0) for b in batch])
+        latents = torch.stack([b[1].squeeze(0) for b in batch])
+        return tokens, latents
+
+    train_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(train_indices),
+        num_workers=num_workers,
+        drop_last=True,
+        collate_fn=_collate_fn,
+    )
+
+    val_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=SequentialSampler(val_indices),
+        num_workers=0,
+        drop_last=False,
+        collate_fn=_collate_fn,
+    )
+
+    return train_loader, val_loader, dataset
 
 
 # ── CLI ─────────────────────────────────────────────────────────────
@@ -57,13 +132,27 @@ def _make_output_dir(base: str) -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train DinoToVAE")
 
-    # Data
+    # ── Mode selection ──────────────────────────────────────────
+    g = p.add_argument_group("mode")
+    g.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Cache directory for pre-encoded shards (cached mode)",
+    )
+    g.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Force image mode (ignore cache)",
+    )
+
+    # ── Data (image mode) ──────────────────────────────────────
     g = p.add_argument_group("data")
     g.add_argument(
         "--dataset",
         type=Path,
         default=Path("$DATASET_ROOT/danbooru-images/danbooru-images"),
-        help="Root directory with image subfolders",
+        help="Root directory with image subfolders (image mode only)",
     )
     g.add_argument("--batch-size", type=int, default=8)
     g.add_argument("--num-workers", type=int, default=16)
@@ -72,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     )
     g.add_argument("--val-ratio", type=float, default=0.1)
 
-    # Model
+    # ── Model ──────────────────────────────────────────────────
     g = p.add_argument_group("model")
     g.add_argument(
         "--mapper",
@@ -84,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--hidden-channels", type=int, default=256)
     g.add_argument("--num-layers", type=int, default=4)
 
-    # Training
+    # ── Training ───────────────────────────────────────────────
     g = p.add_argument_group("training")
     g.add_argument("--epochs", type=int, default=100)
     g.add_argument("--lr", type=float, default=1e-3)
@@ -95,7 +184,7 @@ def parse_args() -> argparse.Namespace:
         "--resume", type=str, default=None, help="Checkpoint path to resume from"
     )
 
-    # Output
+    # ── Output ─────────────────────────────────────────────────
     g = p.add_argument_group("output")
     g.add_argument(
         "--output",
@@ -104,7 +193,7 @@ def parse_args() -> argparse.Namespace:
         help="Output directory (default: runs/exp or runs/exp_YYYYMMDD_HHMMSS)",
     )
 
-    # Debug
+    # ── Debug ──────────────────────────────────────────────────
     g = p.add_argument_group("debug")
     g.add_argument("--debug", action="store_true", help="Quick run on a tiny subset")
 
@@ -118,13 +207,18 @@ def main() -> None:
     args = parse_args()
     load_dotenv()
 
-    # ── Resolve dataset ──────────────────────────────────────────
+    # ── Determine mode ─────────────────────────────────────────
+    use_cached = args.cache_dir is not None and not args.no_cache
+    mode_label = "cached" if use_cached else "image"
+    print(f"[train] Mode: {mode_label}")
+
+    # ── Resolve dataset ────────────────────────────────────────
     dataset_root = Path(os.environ.get("DATASET_ROOT", str(args.dataset)))
 
-    # ── Output dir ───────────────────────────────────────────────
+    # ── Output dir ─────────────────────────────────────────────
     output_dir = _make_output_dir(args.output)
 
-    # ── Config ───────────────────────────────────────────────────
+    # ── Config ─────────────────────────────────────────────────
     config = TrainingConfig(
         lr=args.lr,
         epochs=args.epochs,
@@ -137,10 +231,10 @@ def main() -> None:
         mapper=args.mapper,
         hidden_channels=args.hidden_channels,
         num_layers=args.num_layers,
-        dataset=str(dataset_root),
+        dataset=str(dataset_root) if not use_cached else str(args.cache_dir),
     )
 
-    # ── Debug mode: tiny subset ──────────────────────────────────
+    # ── Debug mode: tiny subset ────────────────────────────────
     if args.debug:
         config.epochs = 2
         config.batch_size = 2
@@ -151,49 +245,70 @@ def main() -> None:
             f"[train] Debug mode: {config.epochs} epochs, batch={config.batch_size}, val_freq={config.val_freq}"
         )
 
-    # ── Load models ──────────────────────────────────────────────
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[train] Device: {device}")
-    print(f"[train] Loading models...")
-    vae = load_vae(device)
-    dino = load_dino(device)
-    print(f"[train] VAE: {vae.latent_channels} latent channels")
-    print(f"[train] DINO: {dino.feature_dim} feature dim")
+    # ── Mode-specific setup ────────────────────────────────────
+    if use_cached:
+        # ── Cached mode: load shards ─────────────────────────────
+        print(f"[train] Cache dir: {args.cache_dir}")
 
-    # ── Load dataset ─────────────────────────────────────────────
-    print(f"[train] Scanning dataset: {dataset_root}")
-    t0 = time.time()
-    jpgs = scan_dataset(dataset_root, pattern="**/*.jpg", use_cache=True)
-    pngs = scan_dataset(dataset_root, pattern="**/*.png", use_cache=True)
-    all_paths = jpgs + pngs
-    print(f"[train] Found {len(all_paths):,} images ({time.time() - t0:.1f}s)")
+        # Check cache exists
+        if not args.cache_dir.exists():
+            print(f"[train] ERROR: Cache directory does not exist: {args.cache_dir}")
+            print(f"[train] Run `python -m src.encode` first to create cache")
+            return
 
-    # Debug: subsample
-    if args.debug:
-        all_paths = all_paths[:40]
-        print(f"[train] Debug: subsampled to {len(all_paths)} images")
+        train_loader, val_loader, dataset = _make_cached_dataloaders(
+            cache_dir=args.cache_dir,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            val_ratio=config.val_ratio,
+            shard_size=1000,
+            seed=42,
+        )
+        print(f"[train] Dataset: {dataset.info()}")
+        vae = None
+        dino = None
 
-    if len(all_paths) == 0:
-        print(f"[train] ERROR: No images found at {dataset_root}")
-        print(f"[train] Set DATASET_ROOT environment variable or use --dataset")
-        return
+    else:
+        # ── Image mode: scan + encode per batch (backward compat) ─
+        print(f"[train] Scanning dataset: {dataset_root}")
+        t0 = time.time()
+        jpgs = scan_dataset(dataset_root, pattern="**/*.jpg", use_cache=True)
+        pngs = scan_dataset(dataset_root, pattern="**/*.png", use_cache=True)
+        all_paths = jpgs + pngs
+        print(f"[train] Found {len(all_paths):,} images ({time.time() - t0:.1f}s)")
 
-    # ── Create DataLoaders ───────────────────────────────────────
-    # Create DataLoaders
-    train_loader, val_loader, _ = create_dataloaders(
-        all_paths,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        prefetch_factor=args.prefetch,
-        train_ratio=0.9,
-        val_ratio=config.val_ratio,
-    )
-    print(
-        f"[train] Train: {len(train_loader.dataset):,} images, "
-        f"Val: {len(val_loader.dataset):,} images"
-    )
+        # Debug: subsample
+        if args.debug:
+            all_paths = all_paths[:40]
+            print(f"[train] Debug: subsampled to {len(all_paths)} images")
 
-    # ── Print output structure ──────────────────────────────────
+        if len(all_paths) == 0:
+            print(f"[train] ERROR: No images found at {dataset_root}")
+            return
+
+        train_loader, val_loader, _ = create_dataloaders(
+            all_paths,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            prefetch_factor=args.prefetch,
+            train_ratio=0.9,
+            val_ratio=config.val_ratio,
+        )
+        print(
+            f"[train] Train: {len(train_loader.dataset):,} images, "
+            f"Val: {len(val_loader.dataset):,} images"
+        )
+
+        # Load DINO + VAE for image mode
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[train] Device: {device}")
+        print(f"[train] Loading models...")
+        vae = load_vae(device)
+        dino = load_dino(device)
+        print(f"[train] VAE: {vae.latent_channels} latent channels")
+        print(f"[train] DINO: {dino.feature_dim} feature dim")
+
+    # ── Print output structure ─────────────────────────────────
     print(f"\n[train] Output directory: {output_dir}/")
     print(f"  ├── config.yaml           # training config")
     print(f"  ├── checkpoints/")
@@ -204,11 +319,15 @@ def main() -> None:
     print(f"  └── logs/")
     print(f"      └── train.log         # training log")
 
-    # ── Run training ─────────────────────────────────────────────
+    # ── Run training ───────────────────────────────────────────
     print(
-        f"\n[train] Starting training: {config.epochs} epochs, mapper={config.mapper}, batch={config.batch_size}"
+        f"\n[train] Starting training: {config.epochs} epochs, "
+        f"mapper={config.mapper}, batch={config.batch_size}, mode={mode_label}"
     )
     resume_path = args.resume if args.resume else None
+
+    # Cached mode: pass dino=None, vae=None → run_training auto-detects
+    # Image mode: pass dino+vae → run_training uses image mode
     mapper, optimizer = run_training(
         config=config,
         train_loader=train_loader,

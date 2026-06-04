@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+from src.cache import (
+    CachedDataset,
+    CacheManifest,
+    ShardAwareSampler,
+    ShardCache,
+    ShardCacheConfig,
+    ShardMeta,
+    compute_dataset_hash,
+    load_manifest,
+    save_manifest,
+    validate_cache,
+)
 from src.dataset import (
     create_dataloaders,
     default_transform,
@@ -15,11 +27,24 @@ from src.trainer import (
     run_training,
     save_checkpoint,
     train_epoch,
+    train_epoch_cached,
     validate_epoch,
+    validate_epoch_cached,
 )
 from src.utility import scan_dataset
 
 __all__ = [
+    # cache
+    "CachedDataset",
+    "ShardAwareSampler",
+    "ShardCache",
+    "ShardCacheConfig",
+    "ShardMeta",
+    "CacheManifest",
+    "load_manifest",
+    "save_manifest",
+    "validate_cache",
+    "compute_dataset_hash",
     # dataset
     "create_dataloaders",
     "default_transform",
@@ -36,7 +61,9 @@ __all__ = [
     # trainer
     "TrainingConfig",
     "train_epoch",
+    "train_epoch_cached",
     "validate_epoch",
+    "validate_epoch_cached",
     "create_mapper",
     "run_training",
     "save_checkpoint",

@@ -2,9 +2,14 @@
 
 Provides:
     * ``TrainingConfig`` — all hyper-parameters as a dataclass
-    * ``train_epoch()`` / ``validate_epoch()`` — per-epoch helpers
+    * ``train_epoch()`` / ``validate_epoch()`` — per-epoch helpers (image mode)
+    * ``train_epoch_cached()`` / ``validate_epoch_cached()`` — cached mode
     * ``save_checkpoint()`` / ``load_checkpoint()`` — state persistence
-    * ``run_training()`` — one-shot full training call
+    * ``run_training()`` — one-shot full training call (auto-detects mode)
+
+Two training modes:
+    Image mode (default): images → DINOv3 → mapper → VAE → latents
+    Cached mode:          patch_tokens + gt_latents from shard cache
 """
 
 from __future__ import annotations
@@ -145,6 +150,47 @@ def _decode_samples(
     mapper.train()
 
 
+def _decode_samples_cached(
+    mapper: nn.Module,
+    loader: DataLoader,
+    vae: VAEModel | None,
+    device: torch.device,
+    out_dir: Path,
+    num_samples: int = 4,
+) -> None:
+    """Decode samples from cached loader (patch_tokens + gt_latents)."""
+    from torchvision.utils import save_image
+
+    mapper.eval()
+    samples_saved = 0
+    with torch.no_grad():
+        for tokens, _ in loader:
+            if samples_saved >= num_samples:
+                break
+            tokens = tokens.squeeze(1).to(device)
+            pred_latents = mapper(tokens)
+            if vae is not None:
+                decoded = vae.decode(pred_latents)
+            else:
+                decoded = pred_latents
+            for i in range(min(decoded.shape[0], num_samples - samples_saved)):
+                if vae is not None:
+                    save_image(
+                        decoded[i],
+                        out_dir / f"sample_{samples_saved:03d}.png",
+                        normalize=True,
+                        value_range=(-1, 1),
+                    )
+                else:
+                    save_image(
+                        pred_latents[i], out_dir / f"sample_{samples_saved:03d}.png"
+                    )
+                samples_saved += 1
+                if samples_saved >= num_samples:
+                    break
+    mapper.train()
+
+
 def train_epoch(
     mapper: nn.Module,
     optimizer: Optimizer,
@@ -240,6 +286,92 @@ def validate_epoch(
     return total_loss / n_samples
 
 
+# ── Cached Epoch helpers ───────────────────────────────────────────
+
+
+def train_epoch_cached(
+    mapper: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    loader: DataLoader,
+    device: torch.device,
+    debug: bool = False,
+    log_freq: int = 100,
+    logger: logging.Logger | None = None,
+    epoch: int = 0,
+) -> float:
+    """Run one training epoch with cached data (patch_tokens + gt_latents).
+
+    Unlike train_epoch(), this does NOT need DINOv3 or VAE - the data is already encoded.
+    Only the mapper model is trained, making it ~100x faster per step.
+    """
+    mapper.train()
+    total_loss = 0.0
+    n_samples = 0
+
+    for batch_idx, (patch_tokens, gt_latents) in enumerate(loader):
+        patch_tokens = patch_tokens.to(device)  # [B, 1024, 384]
+        gt_latents = gt_latents.to(device)  # [B, 16, 64, 64]
+        optimizer.zero_grad()
+
+        if debug:
+            print(
+                f"[debug] batch {batch_idx}: tokens={patch_tokens.shape}, gt={gt_latents.shape}"
+            )
+
+        # Mapper → pred latents
+        pred_latents = mapper(patch_tokens)  # [B, 16, 64, 64]
+
+        if debug:
+            print(f"[debug] pred_latents={pred_latents.shape}")
+
+        # Loss & backward (only mapper parameters)
+        loss = F.mse_loss(pred_latents, gt_latents)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item() * patch_tokens.shape[0]
+        n_samples += patch_tokens.shape[0]
+
+        # Log every N steps, and always on step 1
+        if (
+            logger is not None
+            and log_freq > 0
+            and ((batch_idx + 1) % log_freq == 0 or batch_idx == 0)
+        ):
+            global_step = epoch * len(loader) + batch_idx + 1
+            logger.info(
+                f"  step {global_step:,}  batch={batch_idx + 1}  "
+                f"loss={loss.item():.4f}  lr={optimizer.param_groups[0]['lr']:.6f}"
+            )
+
+    return total_loss / n_samples
+
+
+def validate_epoch_cached(
+    mapper: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    """Run one validation epoch with cached data (no_grad)."""
+    mapper.eval()
+    total_loss = 0.0
+    n_samples = 0
+
+    with torch.no_grad():
+        for patch_tokens, gt_latents in loader:
+            patch_tokens = patch_tokens.to(device)
+            gt_latents = gt_latents.to(device)
+
+            pred_latents = mapper(patch_tokens)
+            loss = F.mse_loss(pred_latents, gt_latents)
+            total_loss += loss.item() * patch_tokens.shape[0]
+            n_samples += patch_tokens.shape[0]
+
+    return total_loss / n_samples
+
+
 # ── Checkpoint ────────────────────────────────────────────────────
 
 
@@ -313,12 +445,16 @@ def run_training(
 ) -> tuple[nn.Module, Optimizer]:
     """Run the full training loop.
 
+    Auto-detects training mode based on whether DINO/VAE are provided:
+        - With dino+vae: image mode (images -> DINO -> mapper -> VAE)
+        - Without dino/vae: cached mode (patch_tokens + latents from cache)
+
     Args:
         config: Training configuration.
         train_loader: Training DataLoader.
         val_loader: Optional validation DataLoader.
-        dino: Preloaded DINO model (auto-loads if None).
-        vae: Preloaded VAE model (auto-loads if None).
+        dino: DINO model (None for cached mode).
+        vae: VAE model (None for cached mode).
         resume_from: Path to checkpoint file to resume from.
 
     Returns:
@@ -328,19 +464,21 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out = Path(config.output_dir)
 
+    # Auto-detect mode
+    use_cached = dino is None and vae is None
+    if use_cached:
+        mode_label = "cached (patch_tokens + latents)"
+    else:
+        mode_label = "image (DINO + VAE encode)"
+
     # Setup logger
     logger = setup_logging(config.output_dir)
 
     # Save config
     save_config(config, out)
     logger.info(f"Output directory: {out}")
+    logger.info(f"Mode: {mode_label}")
     logger.info(f"Dataset: {config.dataset}")
-
-    # Load models
-    if dino is None:
-        dino = load_dino(device)
-    if vae is None:
-        vae = load_vae(device)
 
     mapper = create_mapper(config, device)
     total_params = sum(p.numel() for p in mapper.parameters())
@@ -367,39 +505,65 @@ def run_training(
 
     # Training loop
     for epoch in range(start_epoch, config.epochs):
-        train_loss = train_epoch(
-            mapper,
-            optimizer,
-            scheduler,
-            train_loader,
-            dino,
-            vae,
-            device,
-            debug=config.debug,
-            log_freq=config.log_freq,
-            logger=logger,
-            epoch=epoch,
-        )
+        if use_cached:
+            train_loss = train_epoch_cached(
+                mapper,
+                optimizer,
+                scheduler,
+                train_loader,
+                device,
+                debug=config.debug,
+                log_freq=config.log_freq,
+                logger=logger,
+                epoch=epoch,
+            )
+        else:
+            train_loss = train_epoch(
+                mapper,
+                optimizer,
+                scheduler,
+                train_loader,
+                dino,
+                vae,
+                device,
+                debug=config.debug,
+                log_freq=config.log_freq,
+                logger=logger,
+                epoch=epoch,
+            )
         logger.info(f"Epoch {epoch + 1}/{config.epochs}  loss={train_loss:.4f}")
 
         # Validation
         if val_loader and (epoch % config.val_freq == 0 or epoch == 0):
-            val_loss = validate_epoch(mapper, val_loader, dino, vae, device)
+            if use_cached:
+                val_loss = validate_epoch_cached(mapper, val_loader, device)
+            else:
+                val_loss = validate_epoch(mapper, val_loader, dino, vae, device)
             logger.info(f"  val={val_loss:.4f}")
 
             # Decode samples
             if config.sample_images > 0:
                 samples_dir = out / "samples" / f"epoch_{epoch + 1:04d}"
                 samples_dir.mkdir(parents=True, exist_ok=True)
-                _decode_samples(
-                    mapper,
-                    train_loader,
-                    dino,
-                    vae,
-                    device,
-                    samples_dir,
-                    num_samples=config.sample_images,
-                )
+                if use_cached:
+                    _decode_samples_cached(
+                        mapper,
+                        train_loader,
+                        vae,
+                        device,
+                        samples_dir,
+                        num_samples=config.sample_images,
+                    )
+                else:
+                    _decode_samples(
+                        mapper,
+                        train_loader,
+                        dino,
+                        vae,
+                        device,
+                        samples_dir,
+                        num_samples=config.sample_images,
+                    )
                 logger.info(f"  samples saved to {samples_dir}")
 
         # Checkpoint

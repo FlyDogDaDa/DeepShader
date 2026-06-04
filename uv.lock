@@ -168,6 +168,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "torch" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "transformers" },
 ]
 
@@ -185,6 +186,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "torch", specifier = ">=2.10.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", specifier = ">=0.25.0", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "tqdm", specifier = ">=4.66.5" },
     { name = "transformers", specifier = ">=5.9.0" },
 ]
 
