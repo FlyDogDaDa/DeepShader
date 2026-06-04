@@ -28,6 +28,7 @@ from pathlib import Path
 
 import torch
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from src import (
     CacheManifest,
@@ -126,7 +127,11 @@ def parse_args() -> argparse.Namespace:
 class BatchShardEncoder:
     """Encodes a batch of images into DINOv3 patch tokens + VAE latents.
 
-    Buffers images until a full shard is collected, then writes to disk.
+    Buffers are stored as contiguous 1-D tensors (dim=0 = sample dimension).
+    Each feed() appends via ``torch.cat`` on dim=0.  When the buffer reaches
+    ``shard_size`` the head chunk is flushed to disk and removed.
+
+    This avoids Python-list overhead and makes flush a simple slice operation.
     """
 
     def __init__(
@@ -137,27 +142,52 @@ class BatchShardEncoder:
         self.dino_model = dino_model
         self.vae_model = vae_model
 
-        # Buffers
-        self._buffer_tokens: list[torch.Tensor] = []
-        self._buffer_latents: list[torch.Tensor] = []
+        # Buffers – start empty (None means "not yet initialized")
+        self._buffer_tokens: torch.Tensor | None = None
+        self._buffer_latents: torch.Tensor | None = None
         self._buffer_paths: list[str] = []
         self._shard_id: int = 0
 
     @property
     def buffer_size(self) -> int:
-        return len(self._buffer_tokens)
+        """Number of samples currently in the buffer tensors."""
+        if self._buffer_tokens is None:
+            return 0
+        return self._buffer_tokens.shape[0]
 
     @property
     def shard_id(self) -> int:
         return self._shard_id
 
     def feed(self, tokens: torch.Tensor, latents: torch.Tensor, paths: list[str]):
-        """Add encoded batch to buffer. Flushes to disk when shard is full."""
-        self._buffer_tokens.extend(tokens.tolist() if tokens.ndim > 2 else [tokens])
-        self._buffer_latents.extend(latents.tolist() if latents.ndim > 3 else [latents])
+        """Append a batch to the buffer.
+
+        * ``tokens`` shape:  ``[B, 1024, 384]`` (can be on any device)
+        * ``latents`` shape: ``[B, 16, 64, 64]`` (can be on any device)
+
+        Tensors are moved to **CPU** immediately via ``.to('cpu')`` so the
+        buffer only holds RAM tensors — GPU memory is released before the
+        next batch.
+
+        When the buffer reaches ``shard_size`` the first ``shard_size``
+        samples are flushed to disk and removed from the buffer.
+        """
+        # .to('cpu') copies to RAM; original GPU tensor is freed when the
+        # caller drops its reference (patch_tokens / gt_latents).
+        tokens = tokens.to("cpu", non_blocking=True)
+        latents = latents.to("cpu", non_blocking=True)
+
+        if self._buffer_tokens is None:
+            # First batch – initialize buffer tensors
+            self._buffer_tokens = tokens
+            self._buffer_latents = latents
+        else:
+            self._buffer_tokens = torch.cat([self._buffer_tokens, tokens], dim=0)
+            self._buffer_latents = torch.cat([self._buffer_latents, latents], dim=0)
+
         self._buffer_paths.extend(paths)
 
-        # Flush when buffer exceeds shard size
+        # Flush while we have enough (handles last-overflow edge case)
         while self.buffer_size >= self.shard_size:
             self._flush_shard()
 
@@ -167,24 +197,19 @@ class BatchShardEncoder:
             self._flush_shard()
 
     def _flush_shard(self) -> None:
-        """Write current buffer as a shard file."""
-        n = min(self.buffer_size, self.shard_size)
-
-        # Extract shard-sized chunk
-        batch_tokens = torch.stack(
-            [torch.tensor(t, dtype=torch.float16) for t in self._buffer_tokens[:n]]
-        )
-        batch_latents = torch.stack(
-            [torch.tensor(l, dtype=torch.float16) for l in self._buffer_latents[:n]]
-        )
-        shard_paths = self._buffer_paths[:n]
+        """Write the first ``shard_size`` samples from the buffer to disk."""
+        # Slice: first ``shard_size`` samples go to disk, remainder stays.
+        tokens = self._buffer_tokens[: self.shard_size].to(torch.float16)
+        latents = self._buffer_latents[: self.shard_size].to(torch.float16)
+        shard_paths = self._buffer_paths[: self.shard_size]
+        n = tokens.shape[0]
 
         # Write to disk
         shard_dir = self.cache_dir / f"shard_{self._shard_id:05d}"
         shard_dir.mkdir(parents=True, exist_ok=True)
 
-        torch.save(batch_tokens, shard_dir / "patch_tokens.pt")
-        torch.save(batch_latents, shard_dir / "gt_latents.pt")
+        torch.save(tokens, shard_dir / "patch_tokens.pt")
+        torch.save(latents, shard_dir / "gt_latents.pt")
 
         meta = ShardMeta(
             shard_id=self._shard_id,
@@ -204,15 +229,20 @@ class BatchShardEncoder:
 
         print(
             f"  shard_{self._shard_id:05d}: {n} images "
-            f"({batch_tokens.numel() * batch_tokens.element_size() / 1e6:.1f} MB)"
+            f"({tokens.numel() * tokens.element_size() / 1e6:.1f} MB)"
         )
 
         self._shard_id += 1
 
-        # Remove flushed items
-        self._buffer_tokens = self._buffer_tokens[n:]
-        self._buffer_latents = self._buffer_latents[n:]
-        self._buffer_paths = self._buffer_paths[n:]
+        # Remove flushed samples from buffer (slice remainder)
+        if self._buffer_tokens is not None:
+            remainder = self.shard_size
+            self._buffer_tokens = self._buffer_tokens[remainder:]
+            self._buffer_latents = self._buffer_latents[remainder:]
+            self._buffer_paths = self._buffer_paths[remainder:]
+        # If buffer was already <= shard_size before slice, remainder is empty.
+        # torch.cat on empty would error, so after the above slice the tensors
+        # may become size [0, ...].  That's fine – next feed() will re-init.
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -327,7 +357,16 @@ def main() -> None:
     dataset = ImageDataset(remaining_paths, transform=transform)
 
     with torch.no_grad():
-        for i in range(0, len(dataset), batch_size):
+        # tqdm: one batch iteration with overall progress bar
+        batch_count = (len(dataset) + batch_size - 1) // batch_size
+        pbar = tqdm(
+            range(batch_count),
+            desc="Encoding",
+            unit="batches",
+            initial=0,
+        )
+        for batch_idx in pbar:
+            i = batch_idx * batch_size
             batch_tensors = [
                 dataset[j] for j in range(i, min(i + batch_size, len(dataset)))
             ]
@@ -350,13 +389,22 @@ def main() -> None:
             batch_paths_str = [str(remaining_paths[j]) for j in range(i, batch_end)]
             encoder.feed(patch_tokens, gt_latents, batch_paths_str)
 
+            # Explicitly drop GPU references — encoder.feed() already
+            # moved the data to CPU, so these are now harmless.
+            del patch_tokens
+            del gt_latents
+            torch.cuda.empty_cache()
+
+            # Update tqdm with shard info
             elapsed = time.time() - t_total
             shard_num = encoder.shard_id
-            if shard_num % 10 == 0:
-                rate = shard_num / max(elapsed, 1) * 60
-                print(
-                    f"  [{shard_num:05d}] {elapsed:.0f}s elapsed, ~{rate:.0f} shards/min"
-                )
+            pbar.set_postfix(
+                {
+                    "shards": shard_num,
+                    "img": shard_num * args.shard_size,
+                    "rate": f"{elapsed / max(shard_num, 1):.1f}s/shard",
+                }
+            )
 
     encoder.flush()
 
