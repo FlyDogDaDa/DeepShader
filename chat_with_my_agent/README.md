@@ -106,7 +106,7 @@ Phase 1: Training（每次訓練，毫秒級 batch）
 
 | 狀態 | 項目 | 來源 |
 |------|------|------|
-| ⏳ | 執行 pre-encode（預估 ~2 小時） | [15](./15_2026_06_04_human_pre-encode-cache-pipeline.md) |
+| ⏳ | 執行 pre-encode（預估 ~7-8 小時） | [15](./15_2026_06_04_human_pre-encode-cache-pipeline.md) |
 | ⏳ | 實測 cached training loop | [18](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |
 | ⏳ | 驗證 image mode backward compat | [18](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |
 | ⏳ | 清理 type warnings（不影響功能） | [18](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |

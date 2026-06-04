@@ -135,7 +135,7 @@ patch_tokens = patch_tokens.to(device)
 
 ## Follow-up
 
-- [ ] 明天檢查 pre-encode 進度（背景跑了 `batch=16`，21065 batches × 1.3s/batch ≈ 4.5 小時）
+- [ ] 明天檢查 pre-encode 進度（背景跑了 `batch=16`，21065 batches × 1.3s/batch ≈ 7.6 小時）
 - [ ] pre-encode 完成後測試 cached training：`python -m train --cache-dir ~/hdd/cache --debug`
 - [ ] 測試 image mode backward compat
 - [ ] 清理 type warnings（optional, doesn't affect functionality）
