@@ -2,17 +2,18 @@
 """Decode VAE latent samples to images.
 
 Usage:
-    # Batch decode all samples from a checkpoint's samples directory
+    # Batch decode all sample_*.pt files (epoch-by-epoch)
     uv run python -m src.decode --samples runs/exp/samples
 
-    # Decode specific index
-    uv run python -m src.decode --idx 0
-
-    # Decode a specific pred_latents file
-    uv run python -m src.decode --latent runs/exp/samples/idx_00000/pred_latents.pt
+    # Decode a specific sample file
+    uv run python -m src.decode --latent runs/exp/samples/sample_0001.pt
 
     # CPU decoding (no GPU needed)
     uv run python -m src.decode --samples runs/exp/samples --device cpu
+
+New format: samples/sample_{epoch}.pt is a dict
+    {"idx_0": {tokens, gt_latents, pred_latents}, ...}
+Each file outputs {epoch}_idx{idx}.png per dataset index.
 """
 
 from __future__ import annotations
@@ -81,7 +82,8 @@ def main() -> None:
     print(f"[decode] VAE loaded on {args.device}")
 
     # ── Determine input files ──────────────────────────────
-    latents: list[tuple[Path, Path]] = []  # (pred_latents_path, output_path)
+    # Each entry: (sample_path, out_dir, stem, fmt)
+    latents: list[tuple[Path, Path, str, str]] = []
 
     if args.latent:
         latents.append(_resolve_single(Path(args.latent), args.output_dir))
@@ -91,7 +93,8 @@ def main() -> None:
         if not samples_dir.exists():
             print(f"[decode] ERROR: samples directory not found: {samples_dir}")
             return
-        latents.extend(_resolve_batch(samples_dir, args.output_dir))
+        latents.extend(_resolve_batch(samples_dir, args.output_dir, args.format))
+        print(f"[decode] Found {len(latents)} samples to decode")
 
     elif args.idx is not None:
         # Try to find samples directory from current directory
@@ -101,7 +104,7 @@ def main() -> None:
                 "[decode] ERROR: Could not find samples directory. Use --samples or --latent directly."
             )
             return
-        latents.extend(_resolve_batch(best, args.output_dir))
+        latents.extend(_resolve_batch(best, args.output_dir, args.format))
 
     else:
         print("[decode] ERROR: Provide --samples, --latent, or --idx")
@@ -112,46 +115,50 @@ def main() -> None:
         return
 
     # ── Decode ─────────────────────────────────────────────
+    # Each entry: (sample_path, out_dir, stem, fmt)
+    # sample_*.pt contains {"idx_0": {pred_latents: ...}, ...}
     decoded = 0
     with torch.no_grad():
-        for latents_path, out_path in tqdm(latents, desc="Decoding"):
-            pred = torch.load(latents_path, map_location=args.device, weights_only=True)
-            decoded_img = vae.decode(pred)  # [B, 3, 512, 512]
+        for sample_path, out_dir, stem, fmt in tqdm(latents, desc="Decoding"):
+            data = torch.load(sample_path, map_location=args.device, weights_only=False)
             from torchvision.utils import save_image
 
-            save_image(
-                decoded_img,
-                out_path,
-                normalize=True,
-                value_range=(-1, 1),
-            )
-            decoded += 1
+            for idx_key, item in sorted(data.items()):
+                pred_latents = item["pred_latents"]
+                decoded_img = vae.decode(pred_latents)  # [B, 3, 512, 512]
+                # Parse dataset idx from "idx_0"
+                idx_num = idx_key.split("_")[1]
+                img_path = out_dir / f"{stem}_idx{idx_num}.{fmt}"
+                save_image(
+                    decoded_img,
+                    img_path,
+                    normalize=True,
+                    value_range=(-1, 1),
+                )
+                decoded += 1
 
-    print(f"[decode] Decoded {decoded} images to {out_path.parent}")
+    print(f"[decode] Decoded {decoded} images to {out_dir}")
 
 
-def _resolve_single(latents_path: Path, output_dir: str | None) -> tuple[Path, Path]:
-    """Resolve a single latent file to output path."""
+def _resolve_single(
+    latents_path: Path, output_dir: str | None, fmt: str
+) -> list[tuple[dict[str, torch.Tensor], Path]]:
+    """Resolve a single sample_*.pt file to output paths (one per idx)."""
     out_dir = Path(output_dir) if output_dir else latents_path.parent
-    name = latents_path.stem  # e.g. "pred_latents"
-    out_path = out_dir / f"{name}_decoded.png"
-    return latents_path, out_path
+    # Parse epoch from filename: sample_0001.pt → 0001
+    stem = latents_path.stem  # e.g. "sample_0001"
+    return [(latents_path, out_dir, stem, fmt)]
 
 
 def _resolve_batch(
-    samples_dir: Path, output_dir: str | None
-) -> list[tuple[Path, Path]]:
-    """Resolve all pred_latents.pt files in samples directory tree."""
+    samples_dir: Path, output_dir: str | None, fmt: str
+) -> list[tuple[dict[str, torch.Tensor], Path, str, str]]:
+    """Resolve all sample_*.pt files in samples directory."""
     results = []
     out_dir = Path(output_dir) if output_dir else samples_dir
 
-    for latents_path in sorted(samples_dir.rglob("pred_latents.pt")):
-        # Compute output path: samples/idx_00000/pred_latents.pt
-        # → samples/idx_00000_decoded.png
-        idx_dir = latents_path.parent
-        rel = idx_dir.relative_to(samples_dir)
-        out_path = out_dir / f"{rel}_decoded.png"
-        results.append((latents_path, out_path))
+    for sample_path in sorted(samples_dir.glob("sample_*.pt")):
+        results.append((sample_path, out_dir, sample_path.stem, fmt))
 
     return results
 
