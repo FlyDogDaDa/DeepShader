@@ -147,7 +147,8 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ── Data (image mode) ──────────────────────────────────────
-    g = p.add_argument_group("data")
+    g = p.add_argument_group("data (image mode)")
+    g.add_argument("--num-workers", type=int, default=16)
     g.add_argument(
         "--dataset",
         type=Path,
@@ -155,7 +156,6 @@ def parse_args() -> argparse.Namespace:
         help="Root directory with image subfolders (image mode only)",
     )
     g.add_argument("--batch-size", type=int, default=8)
-    g.add_argument("--num-workers", type=int, default=16)
     g.add_argument(
         "--prefetch", type=int, default=20, help="DataLoader prefetch_factor"
     )
@@ -256,10 +256,13 @@ def main() -> None:
             print(f"[train] Run `python -m src.encode` first to create cache")
             return
 
+        # CachedDataset uses internal LRU cache, no need for multiple workers.
+        # Using num_workers=0 (main process) avoids spawning subprocesses that
+        # each load shard tensors into RAM → OOM.
         train_loader, val_loader, dataset = _make_cached_dataloaders(
             cache_dir=args.cache_dir,
             batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            num_workers=0,
             val_ratio=config.val_ratio,
             shard_size=1000,
             seed=42,
