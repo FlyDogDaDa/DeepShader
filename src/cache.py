@@ -329,9 +329,20 @@ class ShardAwareSampler(Sampler[int]):  # noqa: D101
     With 288 shards and LRU(8), random shuffle gives hit rate ~2.8%,
     while shard-aware shuffle gives ~97.2% (8/288 = 1 miss per 125 batches).
 
+    Supports optional train/val split via ``train_ratio``.
+    When split is used, both train and val iterators inherit the same
+    shard-aware access pattern — only the sample assignment differs.
+
     Usage:
         sampler = ShardAwareSampler(dataset, shard_size=1000, seed=42)
         loader = DataLoader(dataset, batch_size=8, sampler=sampler)
+        # ── or with train/val split ──
+        train_sampler = ShardAwareSampler(
+            dataset, train_ratio=0.9, seed=42, is_train=True,
+        )
+        val_sampler = ShardAwareSampler(
+            dataset, train_ratio=0.9, seed=42, is_train=False,
+        )
         # ⚠️ DO NOT set shuffle=True when using this sampler
     """
 
@@ -340,28 +351,45 @@ class ShardAwareSampler(Sampler[int]):  # noqa: D101
         dataset: CachedDataset,
         shard_size: int = 1000,
         seed: int = 42,
+        train_ratio: float | None = None,
+        is_train: bool = True,
     ):
         self.dataset = dataset
         self.shard_size = shard_size
         self.seed = seed
+        self.train_ratio = train_ratio
+        self.is_train = is_train
 
-    def __iter__(self) -> Iterator[int]:  # noqa: D102
+        # Pre-compute the shuffled sample list so train/val split
+        # preserves the shard-aware sequential access pattern.
         rng = random.Random(self.seed)
-
-        # Level 1: shuffle shard order
         shard_ids = list(range(self.dataset.shard_count))
         rng.shuffle(shard_ids)
 
-        # Level 2: yield samples from each shard (shuffled within)
+        self._ordered_indices: list[int] = []
         for shard_id in shard_ids:
             shard_rng = random.Random(self.seed + shard_id)
             offsets = list(range(self.shard_size))
             shard_rng.shuffle(offsets)
-
             for offset in offsets:
                 global_idx = shard_id * self.shard_size + offset
                 if global_idx in self.dataset._index_map:
-                    yield global_idx
+                    self._ordered_indices.append(global_idx)
+
+        # ── Optional train/val split ─────────────────────────
+        # Split AFTER the shard-aware ordering so both train and val
+        # inherit the same sequential shard-access pattern.
+        if self.train_ratio is not None:
+            n_train = int(len(self._ordered_indices) * self.train_ratio)
+            if self.is_train:
+                self._indices = self._ordered_indices[:n_train]
+            else:
+                self._indices = self._ordered_indices[n_train:]
+        else:
+            self._indices = self._ordered_indices
+
+    def __iter__(self) -> Iterator[int]:  # noqa: D102
+        yield from self._indices
 
     def __len__(self) -> int:
-        return len(self.dataset)
+        return len(self._indices)
