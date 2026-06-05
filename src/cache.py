@@ -237,17 +237,22 @@ class CachedDataset(Dataset[Any]):  # noqa: D101
         loader = DataLoader(dataset, batch_size=8, sampler=sampler)
     """
 
-    def __init__(self, config: ShardCacheConfig):
+    def __init__(
+        self,
+        config: ShardCacheConfig,
+        subset_indices: set[int] | None = None,
+    ):
         self.config = config
         self.shard_size = config.shard_size
         self._cache = ShardCache(config.max_cached_shards)
-        self._build_index_map()
+        self._build_index_map(subset_indices)
 
-    def _build_index_map(self) -> None:
-        """Build {global_idx → (shard_id, offset)} lookup table.
+    def _build_index_map(self, subset_indices: set[int] | None = None) -> None:
+        """Build {global_idx → (shard_id, local_offset)} lookup table.
 
-        Reads shard directories sorted by name to infer shard_id.
-        Does NOT shuffle — shuffle is handled by the Sampler.
+        When ``subset_indices`` is provided, only builds entries for those
+        specific indices — useful for debug mode to skip reading all 338
+        shard metadata files.
         """
         cache_dir = self.config.cache_dir
         manifest = load_manifest(cache_dir)
@@ -256,15 +261,40 @@ class CachedDataset(Dataset[Any]):  # noqa: D101
         self._index_map: dict[int, tuple[int, int]] = {}
         global_idx = 0
 
-        for shard_id in range(self.shard_count):
-            shard_dir = cache_dir / f"shard_{shard_id:05d}"
-            meta_path = shard_dir / "meta.json"
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text())
-                n = meta["n_images"]
-                for offset in range(n):
-                    self._index_map[global_idx] = (shard_id, offset)
-                    global_idx += 1
+        if subset_indices is not None:
+            # Fast path: only build index entries for requested indices.
+            # Skip reading shard metadata files that can't contain needed
+            # indices, cutting 338 metadata reads to ~1.
+            needed = set(subset_indices)
+            for shard_id in range(self.shard_count):
+                if not needed:
+                    break
+                shard_dir = cache_dir / f"shard_{shard_id:05d}"
+                meta_path = shard_dir / "meta.json"
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text())
+                    n = meta["n_images"]
+                    shard_end = global_idx + n
+                    # Only read shard if needed indices fall in its range
+                    if needed & set(range(global_idx, shard_end)):
+                        for offset in range(n):
+                            idx = global_idx + offset
+                            if idx in needed:
+                                self._index_map[idx] = (shard_id, offset)
+                                needed.discard(idx)
+                            if not needed:
+                                break
+        else:
+            # Normal path: build full index map
+            for shard_id in range(self.shard_count):
+                shard_dir = cache_dir / f"shard_{shard_id:05d}"
+                meta_path = shard_dir / "meta.json"
+                if meta_path.exists():
+                    meta = json.loads(meta_path.read_text())
+                    n = meta["n_images"]
+                    for offset in range(n):
+                        self._index_map[global_idx] = (shard_id, offset)
+                        global_idx += 1
 
     def __len__(self) -> int:
         return len(self._index_map)

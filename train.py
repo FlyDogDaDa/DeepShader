@@ -188,9 +188,14 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--lr", type=float, default=1e-3)
     g.add_argument("--warmup-steps", type=int, default=1000)
     g.add_argument("--log-freq", type=int, default=100, help="Log every N steps")
-    g.add_argument("--val-freq", type=int, default=5)
     g.add_argument(
         "--resume", type=str, default=None, help="Checkpoint path to resume from"
+    )
+    g.add_argument(
+        "--sample-indices",
+        type=str,
+        default=None,
+        help="Fixed dataset indices for sampling (e.g. '0,2,4,8'). Saves tokens/gt/pred.pt for manual decoding.",
     )
 
     # ── Output ─────────────────────────────────────────────────
@@ -228,6 +233,10 @@ def main() -> None:
     output_dir = _make_output_dir(args.output)
 
     # ── Config ─────────────────────────────────────────────────
+    sample_indices: list[int] = []
+    if args.sample_indices:
+        sample_indices = [int(i) for i in args.sample_indices.split(",")]
+
     config = TrainingConfig(
         lr=args.lr,
         epochs=args.epochs,
@@ -235,12 +244,12 @@ def main() -> None:
         num_workers=args.num_workers,
         warmup_steps=args.warmup_steps,
         log_freq=args.log_freq,
-        val_freq=args.val_freq,
         output_dir=output_dir,
         mapper=args.mapper,
         hidden_channels=args.hidden_channels,
         num_layers=args.num_layers,
         dataset=str(dataset_root) if not use_cached else str(args.cache_dir),
+        sample_indices=sample_indices,
     )
 
     # ── Debug mode: tiny subset ────────────────────────────────
@@ -248,11 +257,8 @@ def main() -> None:
         config.epochs = 2
         config.batch_size = 2
         config.warmup_steps = 2
-        config.val_freq = 1
         config.debug = True
-        print(
-            f"[train] Debug mode: {config.epochs} epochs, batch={config.batch_size}, val_freq={config.val_freq}"
-        )
+        print(f"[train] Debug mode: {config.epochs} epochs, batch={config.batch_size}")
 
     # ── Mode-specific setup ────────────────────────────────────
     if use_cached:
@@ -265,36 +271,78 @@ def main() -> None:
             print(f"[train] Run `python -m src.encode` first to create cache")
             return
 
-        # CachedDataset uses internal LRU cache, no need for multiple workers.
-        # Using num_workers=0 (main process) avoids spawning subprocesses that
-        # each load shard tensors into RAM → OOM.
-        # --cache-shards: how many shards to keep in RAM at once.
-        # Default=8 (~10 GB). Set to total shard count to cache all (~530 GB).
-        train_loader, val_loader, dataset = _make_cached_dataloaders(
+        # Debug mode: avoid ShardAwareSampler (pre-builds 337K index list)
+        # and avoid building full CachedDataset index map (reads 338 meta.json).
+        # Use RandomSampler over a minimal CachedDataset with subset_indices.
+        from torch.utils.data import RandomSampler, SequentialSampler, Subset
+
+        config_ = ShardCacheConfig(
             cache_dir=args.cache_dir,
-            batch_size=config.batch_size,
-            num_workers=0,
-            val_ratio=config.val_ratio,
             shard_size=1000,
             max_cached_shards=args.cache_shards,
-            seed=42,
         )
+        debug_size = 4 if args.debug else 0
+
+        if args.debug:
+            # Debug path: tiny subset, no ShardAwareSampler, no full index map
+            debug_indices = list(range(debug_size))
+
+            def _collate_fn(batch):
+                tokens = torch.stack([b[0].squeeze(0) for b in batch])
+                latents = torch.stack([b[1].squeeze(0) for b in batch])
+                return tokens, latents
+
+            # Only build index entries for debug_size items (~1 meta.json read)
+            # len() == debug_size, indices [0..debug_size-1] all work
+            debug_dataset = CachedDataset(config_, subset_indices=set(debug_indices))
+            train_loader = torch.utils.data.DataLoader(
+                debug_dataset,
+                batch_size=config.batch_size,
+                sampler=RandomSampler(debug_dataset, replacement=False),
+                num_workers=0,
+                drop_last=True,
+                collate_fn=_collate_fn,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                debug_dataset,
+                batch_size=config.batch_size,
+                sampler=SequentialSampler(debug_dataset),
+                num_workers=0,
+                drop_last=False,
+                collate_fn=_collate_fn,
+            )
+            print(
+                f"[train] Debug: {len(debug_dataset)} samples "
+                f"(skipped 338 shards metadata + ShardAwareSampler)"
+            )
+            dataset = debug_dataset
+        else:
+            # Normal path: full dataset with ShardAwareSampler
+            train_loader, val_loader, dataset = _make_cached_dataloaders(
+                cache_dir=args.cache_dir,
+                batch_size=config.batch_size,
+                num_workers=0,
+                val_ratio=config.val_ratio,
+                shard_size=1000,
+                max_cached_shards=args.cache_shards,
+                seed=42,
+            )
+
         print(f"[train] Dataset: {dataset.info()}")
         vae = None
         dino = None
 
     else:
         # ── Image mode: scan + encode per batch (backward compat) ─
-        print(f"[train] Scanning dataset: {dataset_root}")
         t0 = time.time()
         jpgs = scan_dataset(dataset_root, pattern="**/*.jpg", use_cache=True)
         pngs = scan_dataset(dataset_root, pattern="**/*.png", use_cache=True)
         all_paths = jpgs + pngs
         print(f"[train] Found {len(all_paths):,} images ({time.time() - t0:.1f}s)")
 
-        # Debug: subsample
+        # Debug: subsample to a handful of images
         if args.debug:
-            all_paths = all_paths[:40]
+            all_paths = all_paths[:4]
             print(f"[train] Debug: subsampled to {len(all_paths)} images")
 
         if len(all_paths) == 0:

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -72,17 +72,18 @@ class TrainingConfig:
     warmup_steps: int = 1000
     max_steps: int = 0  # 0 = run all epochs
     log_freq: int = 100  # log every N training steps
-    val_freq: int = 5  # validate every N epochs
     val_ratio: float = 0.1  # fraction for validation set
-    sample_images: int = 4  # decode N samples every val step
     debug: bool = False  # print shapes for debugging
     output_dir: str = "runs/default"  # root output directory
     seed: int = 42
-    mapper: str = "mlp"  # "linear" | "mlp"
+    mapper: str = "mlp"  # "linear" | "mlp" | "resnet"
     hidden_channels: int = 256
     num_layers: int = 4
     learnable_norm: bool = True
     dataset: str = ""  # dataset path (for reference)
+    sample_indices: list[int] = field(
+        default_factory=list
+    )  # fixed indices for sampling
 
 
 # ── Config helpers ───────────────────────────────────────────────
@@ -158,45 +159,33 @@ def _decode_samples(
     mapper.train()
 
 
-def _decode_samples_cached(
+def _save_samples_cached(
     mapper: nn.Module,
-    loader: DataLoader,
-    vae: VAEModel | None,
+    dataset: "CachedDataset",  # noqa: F821
+    indices: list[int],
     device: torch.device,
     out_dir: Path,
-    num_samples: int = 4,
 ) -> None:
-    """Decode samples from cached loader (patch_tokens + gt_latents)."""
-    from torchvision.utils import save_image
-
+    """Save sample data for fixed indices (no validation, no VAE needed)."""
     mapper.eval()
-    samples_saved = 0
+    samples_dir = out_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
     with torch.no_grad():
-        for tokens, _ in loader:
-            if samples_saved >= num_samples:
-                break
-            tokens = tokens.to(device)  # already [B, 1024, 384], no squeeze(1)
+        for idx in indices:
+            tokens, gt_latents = dataset[idx]  # [1, 1024, 384], [1, 16, 64, 64]
+            tokens = tokens.to(device)
             pred_latents = mapper(tokens)
-            if vae is not None:
-                decoded = vae.decode(pred_latents)
-                for i in range(min(decoded.shape[0], num_samples - samples_saved)):
-                    save_image(
-                        decoded[i],
-                        out_dir / f"sample_{samples_saved:03d}.png",
-                        normalize=True,
-                        value_range=(-1, 1),
-                    )
-                    samples_saved += 1
-                    if samples_saved >= num_samples:
-                        break
-            else:
-                # Fallback: visualize first 3 latent channels as RGB-ish image
-                lat = pred_latents[0]  # [16, 64, 64]
-                viz = lat[:3]  # [3, 64, 64]
-                viz = (viz - viz.min()) / (viz.max() - viz.min() + 1e-8)
-                save_image(viz, out_dir / f"sample_{samples_saved:03d}.png")
-                samples_saved += 1
+
+            # Save to disk
+            idx_dir = samples_dir / f"idx_{idx:05d}"
+            idx_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(tokens.cpu(), idx_dir / "tokens.pt")
+            torch.save(gt_latents.cpu(), idx_dir / "gt_latents.pt")
+            torch.save(pred_latents.cpu(), idx_dir / "pred_latents.pt")
+
     mapper.train()
+    print(f"[train] Saved {len(indices)} samples to {samples_dir}")
 
 
 def train_epoch(
@@ -457,10 +446,12 @@ def run_training(
         - With dino+vae: image mode (images -> DINO -> mapper -> VAE)
         - Without dino/vae: cached mode (patch_tokens + latents from cache)
 
+    Validation is disabled. Samples are saved as .pt files for later decoding.
+
     Args:
         config: Training configuration.
         train_loader: Training DataLoader.
-        val_loader: Optional validation DataLoader.
+        val_loader: Optional validation DataLoader (ignored, kept for API compat).
         dino: DINO model (None for cached mode).
         vae: VAE model (None for cached mode).
         resume_from: Path to checkpoint file to resume from.
@@ -541,38 +532,15 @@ def run_training(
             )
         logger.info(f"Epoch {epoch + 1}/{config.epochs}  loss={train_loss:.4f}")
 
-        # Validation
-        if val_loader and (epoch % config.val_freq == 0 or epoch == 0):
-            if use_cached:
-                val_loss = validate_epoch_cached(mapper, val_loader, device)
-            else:
-                val_loss = validate_epoch(mapper, val_loader, dino, vae, device)
-            logger.info(f"  val={val_loss:.4f}")
-
-            # Decode samples
-            if config.sample_images > 0:
-                samples_dir = out / "samples" / f"epoch_{epoch + 1:04d}"
-                samples_dir.mkdir(parents=True, exist_ok=True)
-                if use_cached:
-                    _decode_samples_cached(
-                        mapper,
-                        train_loader,
-                        vae,
-                        device,
-                        samples_dir,
-                        num_samples=config.sample_images,
-                    )
-                else:
-                    _decode_samples(
-                        mapper,
-                        train_loader,
-                        dino,
-                        vae,
-                        device,
-                        samples_dir,
-                        num_samples=config.sample_images,
-                    )
-                logger.info(f"  samples saved to {samples_dir}")
+        # Save samples at fixed indices (no validation loss)
+        if config.sample_indices:
+            _save_samples_cached(
+                mapper,
+                train_loader.dataset,
+                config.sample_indices,
+                device,
+                out,
+            )
 
         # Checkpoint
         if config.output_dir:
