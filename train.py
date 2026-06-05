@@ -66,6 +66,7 @@ def _make_cached_dataloaders(
     num_workers: int,
     val_ratio: float,
     shard_size: int = 1000,
+    max_cached_shards: int = 8,
     seed: int = 42,
 ) -> tuple[Any, Any, Any]:
     """Create train/val DataLoaders from cached shards.
@@ -79,7 +80,7 @@ def _make_cached_dataloaders(
     config = ShardCacheConfig(
         cache_dir=cache_dir,
         shard_size=shard_size,
-        max_cached_shards=8,
+        max_cached_shards=max_cached_shards,
     )
     dataset = CachedDataset(config)
 
@@ -143,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         help="Cache directory for pre-encoded shards (cached mode)",
     )
     g.add_argument(
+        "--cache-shards",
+        type=int,
+        default=8,
+        help="Max shards to keep in RAM (default: 8, ~10 GB)",
+    )
+    g.add_argument(
         "--no-cache",
         action="store_true",
         help="Force image mode (ignore cache)",
@@ -169,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         "--mapper",
         type=str,
         default="mlp",
-        choices=["linear", "mlp"],
+        choices=["linear", "mlp", "resnet"],
         help="Mapper architecture",
     )
     g.add_argument("--hidden-channels", type=int, default=256)
@@ -261,12 +268,15 @@ def main() -> None:
         # CachedDataset uses internal LRU cache, no need for multiple workers.
         # Using num_workers=0 (main process) avoids spawning subprocesses that
         # each load shard tensors into RAM → OOM.
+        # --cache-shards: how many shards to keep in RAM at once.
+        # Default=8 (~10 GB). Set to total shard count to cache all (~530 GB).
         train_loader, val_loader, dataset = _make_cached_dataloaders(
             cache_dir=args.cache_dir,
             batch_size=config.batch_size,
             num_workers=0,
             val_ratio=config.val_ratio,
             shard_size=1000,
+            max_cached_shards=args.cache_shards,
             seed=42,
         )
         print(f"[train] Dataset: {dataset.info()}")

@@ -27,7 +27,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from src.models import DinoToVAE_Linear, DinoToVAE_MLP
+from src.models import DinoToVAE_Linear, DinoToVAE_MLP, DinoToVAE_ResNet
 from src.pretrains import DINOModel, VAEModel, load_dino, load_vae
 
 # ── Logger setup ─────────────────────────────────────────────────
@@ -104,12 +104,20 @@ def create_mapper(config: TrainingConfig, device: torch.device) -> nn.Module:
     """Instantiate the mapper network."""
     if config.mapper == "linear":
         return DinoToVAE_Linear().to(device)
-    else:
+    elif config.mapper == "mlp":
         return DinoToVAE_MLP(
             hidden_channels=config.hidden_channels,
             num_layers=config.num_layers,
             learnable_norm=config.learnable_norm,
         ).to(device)
+    elif config.mapper == "resnet":
+        return DinoToVAE_ResNet(
+            hidden_channels=config.hidden_channels,
+            num_layers=config.num_layers,
+            learnable_norm=config.learnable_norm,
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown mapper: {config.mapper}")
 
 
 # ── Epoch helpers ─────────────────────────────────────────────────
@@ -167,27 +175,27 @@ def _decode_samples_cached(
         for tokens, _ in loader:
             if samples_saved >= num_samples:
                 break
-            tokens = tokens.squeeze(1).to(device)
+            tokens = tokens.to(device)  # already [B, 1024, 384], no squeeze(1)
             pred_latents = mapper(tokens)
             if vae is not None:
                 decoded = vae.decode(pred_latents)
-            else:
-                decoded = pred_latents
-            for i in range(min(decoded.shape[0], num_samples - samples_saved)):
-                if vae is not None:
+                for i in range(min(decoded.shape[0], num_samples - samples_saved)):
                     save_image(
                         decoded[i],
                         out_dir / f"sample_{samples_saved:03d}.png",
                         normalize=True,
                         value_range=(-1, 1),
                     )
-                else:
-                    save_image(
-                        pred_latents[i], out_dir / f"sample_{samples_saved:03d}.png"
-                    )
+                    samples_saved += 1
+                    if samples_saved >= num_samples:
+                        break
+            else:
+                # Fallback: visualize first 3 latent channels as RGB-ish image
+                lat = pred_latents[0]  # [16, 64, 64]
+                viz = lat[:3]  # [3, 64, 64]
+                viz = (viz - viz.min()) / (viz.max() - viz.min() + 1e-8)
+                save_image(viz, out_dir / f"sample_{samples_saved:03d}.png")
                 samples_saved += 1
-                if samples_saved >= num_samples:
-                    break
     mapper.train()
 
 
