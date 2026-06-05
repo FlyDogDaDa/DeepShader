@@ -165,27 +165,38 @@ def _save_samples_cached(
     indices: list[int],
     device: torch.device,
     out_dir: Path,
+    epoch: int = 0,
 ) -> None:
-    """Save sample data for fixed indices (no validation, no VAE needed)."""
+    """Save sample predictions for fixed indices at a given epoch.
+
+    Saves one file per checkpoint:
+        samples/sample_0000.pt  → before training (epoch=0, random weights)
+        samples/sample_0001.pt  → after epoch 1
+        samples/sample_0002.pt  → after epoch 2
+
+    Each file is a dict keyed by index:
+        {"idx_0": {tokens, gt_latents, pred_latents}, "idx_1": ...}
+    """
     mapper.eval()
     samples_dir = out_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
+        data = {}
         for idx in indices:
             tokens, gt_latents = dataset[idx]  # [1, 1024, 384], [1, 16, 64, 64]
             tokens = tokens.to(device)
             pred_latents = mapper(tokens)
+            data[f"idx_{idx}"] = {
+                "tokens": tokens.cpu(),
+                "gt_latents": gt_latents.cpu(),
+                "pred_latents": pred_latents.cpu(),
+            }
 
-            # Save to disk
-            idx_dir = samples_dir / f"idx_{idx:05d}"
-            idx_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(tokens.cpu(), idx_dir / "tokens.pt")
-            torch.save(gt_latents.cpu(), idx_dir / "gt_latents.pt")
-            torch.save(pred_latents.cpu(), idx_dir / "pred_latents.pt")
-
+    filepath = samples_dir / f"sample_{epoch:04d}.pt"
+    torch.save(data, filepath)
     mapper.train()
-    print(f"[train] Saved {len(indices)} samples to {samples_dir}")
+    print(f"[train] Saved samples at epoch {epoch} to {filepath}")
 
 
 def train_epoch(
@@ -502,6 +513,17 @@ def run_training(
     logger.info(f"Samples:   {out}/samples/")
     logger.info(f"Log:       {out}/logs/train.log")
 
+    # ── Save initial samples before training starts (epoch=0) ───
+    if config.sample_indices:
+        _save_samples_cached(
+            mapper,
+            train_loader.dataset,
+            config.sample_indices,
+            device,
+            out,
+            epoch=0,
+        )
+
     # Training loop
     for epoch in range(start_epoch, config.epochs):
         if use_cached:
@@ -540,6 +562,7 @@ def run_training(
                 config.sample_indices,
                 device,
                 out,
+                epoch=epoch + 1,
             )
 
         # Checkpoint
