@@ -18,7 +18,13 @@ from src.dataset import (
     create_dataloaders,
     default_transform,
 )
-from src.models import DinoToVAE_Linear, DinoToVAE_MLP, DinoToVAE_ResNet
+from src.models import (
+    DinoToVAE_Linear,
+    DinoToVAE_MLP,
+    DinoToVAE_ResNet,
+    DinoToVAE_Transformer,
+    DinoToVAE_TransformerResNet,
+)
 from src.pretrains import DINO_MEAN, DINO_STD, DINOModel, VAEModel, load_dino, load_vae
 from src.trainer import (
     TrainingConfig,
@@ -59,6 +65,8 @@ __all__ = [
     "DinoToVAE_Linear",
     "DinoToVAE_MLP",
     "DinoToVAE_ResNet",
+    "DinoToVAE_Transformer",
+    "DinoToVAE_TransformerResNet",
     # trainer
     "TrainingConfig",
     "train_epoch",

@@ -176,11 +176,32 @@ def parse_args() -> argparse.Namespace:
         "--mapper",
         type=str,
         default="mlp",
-        choices=["linear", "mlp", "resnet"],
+        choices=["linear", "mlp", "resnet", "transformer", "transformer_resnet"],
         help="Mapper architecture",
     )
     g.add_argument("--hidden-channels", type=int, default=256)
     g.add_argument("--num-layers", type=int, default=4)
+    g.add_argument(
+        "--num-heads", type=int, default=8, help="Transformer attention heads"
+    )
+    g.add_argument(
+        "--num-transformer-layers",
+        type=int,
+        default=1,
+        help="Number of transformer encoder blocks (for transformer mappers)",
+    )
+    g.add_argument(
+        "--mlp-ratio",
+        type=float,
+        default=4.0,
+        help="FFN hidden dim / dim ratio in transformer",
+    )
+    g.add_argument(
+        "--num-resnet-layers",
+        type=int,
+        default=32,
+        help="Number of ResNet blocks (for transformer_resnet mapper)",
+    )
 
     # ── Training ───────────────────────────────────────────────
     g = p.add_argument_group("training")
@@ -248,6 +269,10 @@ def main() -> None:
         mapper=args.mapper,
         hidden_channels=args.hidden_channels,
         num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        num_transformer_layers=args.num_transformer_layers,
+        mlp_ratio=args.mlp_ratio,
+        num_resnet_layers=args.num_resnet_layers,
         dataset=str(dataset_root) if not use_cached else str(args.cache_dir),
         sample_indices=sample_indices,
     )

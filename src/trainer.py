@@ -76,10 +76,17 @@ class TrainingConfig:
     debug: bool = False  # print shapes for debugging
     output_dir: str = "runs/default"  # root output directory
     seed: int = 42
-    mapper: str = "mlp"  # "linear" | "mlp" | "resnet"
+    mapper: str = (
+        "mlp"  # "linear" | "mlp" | "resnet" | "transformer" | "transformer_resnet"
+    )
     hidden_channels: int = 256
     num_layers: int = 4
     learnable_norm: bool = True
+    # Transformer-specific
+    num_heads: int = 8
+    num_transformer_layers: int = 1
+    mlp_ratio: float = 4.0
+    num_resnet_layers: int = 32
     dataset: str = ""  # dataset path (for reference)
     sample_indices: list[int] = field(
         default_factory=list
@@ -103,6 +110,14 @@ def save_config(config: TrainingConfig, out_dir: Path) -> None:
 
 def create_mapper(config: TrainingConfig, device: torch.device) -> nn.Module:
     """Instantiate the mapper network."""
+    from src.models import (
+        DinoToVAE_Linear,
+        DinoToVAE_MLP,
+        DinoToVAE_ResNet,
+        DinoToVAE_Transformer,
+        DinoToVAE_TransformerResNet,
+    )
+
     if config.mapper == "linear":
         return DinoToVAE_Linear().to(device)
     elif config.mapper == "mlp":
@@ -115,6 +130,22 @@ def create_mapper(config: TrainingConfig, device: torch.device) -> nn.Module:
         return DinoToVAE_ResNet(
             hidden_channels=config.hidden_channels,
             num_layers=config.num_layers,
+            learnable_norm=config.learnable_norm,
+        ).to(device)
+    elif config.mapper == "transformer":
+        return DinoToVAE_Transformer(
+            num_heads=config.num_heads,
+            num_layers=config.num_transformer_layers,
+            mlp_ratio=config.mlp_ratio,
+            learnable_norm=config.learnable_norm,
+        ).to(device)
+    elif config.mapper == "transformer_resnet":
+        return DinoToVAE_TransformerResNet(
+            hidden_channels=config.hidden_channels,
+            num_heads=config.num_heads,
+            num_transformer_layers=config.num_transformer_layers,
+            num_resnet_layers=config.num_resnet_layers,
+            mlp_ratio=config.mlp_ratio,
             learnable_norm=config.learnable_norm,
         ).to(device)
     else:
