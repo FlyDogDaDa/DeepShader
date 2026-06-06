@@ -53,6 +53,18 @@ class VAEModel:
         """
         return self._vae.encode(images).latent_dist.mode()
 
+    def encode_distribution(self, images: torch.Tensor):
+        """Encode images and return full Gaussian parameters.
+
+        Args:
+            images: RGB images scaled to ``[-1, 1]``.
+
+        Returns:
+            Tuple ``(mean, logvar)`` each ``[B, 16, 64, 64]``.
+        """
+        latent_dist = self._vae.encode(images).latent_dist
+        return latent_dist.mean, latent_dist.logvar
+
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """Decode latents ``[B, 16, 64, 64]`` → images ``[B, 3, H, W]`` in ``[-1, 1]``.
 

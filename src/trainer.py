@@ -27,7 +27,12 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from src.models import DinoToVAE_Linear, DinoToVAE_MLP, DinoToVAE_ResNet
+from src.models import (
+    DinoToVAE_Linear,
+    DinoToVAE_MLP,
+    DinoToVAE_ResNet,
+    kl_divergence,
+)
 from src.pretrains import DINOModel, VAEModel, load_dino, load_vae
 
 # ── Logger setup ─────────────────────────────────────────────────
@@ -94,6 +99,7 @@ class TrainingConfig:
     sample_indices: list[int] = field(
         default_factory=list
     )  # fixed indices for sampling
+    beta: float = 1e-4  # KL divergence weight (β in MSE + β*KLD)
 
 
 # ── Config helpers ───────────────────────────────────────────────
@@ -209,7 +215,7 @@ def _save_samples_cached(
         samples/sample_0002.pt  → after epoch 2
 
     Each file is a dict keyed by index:
-        {"idx_0": {tokens, gt_latents, pred_latents}, "idx_1": ...}
+        {"idx_0": {tokens, gt_mean, gt_logvar, pred_z}, "idx_1": ...}
     """
     mapper.eval()
     samples_dir = out_dir / "samples"
@@ -218,13 +224,15 @@ def _save_samples_cached(
     with torch.no_grad():
         data = {}
         for idx in indices:
-            tokens, gt_latents = dataset[idx]  # [1, 1024, 384], [1, 16, 64, 64]
+            tokens, gt_mean, gt_logvar = dataset[idx]
             tokens = tokens.to(device)
-            pred_latents = mapper(tokens)
+            # eval: sample=False → pred_z = pred_mean
+            pred_z, _, _ = mapper(tokens, sample=False)
             data[f"idx_{idx}"] = {
                 "tokens": tokens.cpu(),
-                "gt_latents": gt_latents.cpu(),
-                "pred_latents": pred_latents.cpu(),
+                "gt_mean": gt_mean.cpu(),
+                "gt_logvar": gt_logvar.cpu(),
+                "pred_z": pred_z.cpu(),
             }
 
     filepath = samples_dir / f"sample_{epoch:04d}.pt"
@@ -245,10 +253,16 @@ def train_epoch(
     log_freq: int = 100,
     logger: logging.Logger | None = None,
     epoch: int = 0,
+    beta: float = 1e-4,
 ) -> float:
-    """Run one training epoch. Returns mean loss."""
+    """Run one training epoch (image mode).
+
+    Loss: MSE_reconstruction + β * KL(mapper_posterior || VAE_posterior)
+    """
     mapper.train()
     total_loss = 0.0
+    total_mse = 0.0
+    total_kl = 0.0
     n_samples = 0
 
     for batch_idx, images in enumerate(loader):
@@ -264,26 +278,32 @@ def train_epoch(
         if debug:
             print(f"[debug] patch_tokens={patch_tokens.shape}")
 
-        # Mapper → pred latents
-        pred_latents = mapper(patch_tokens)  # [B, 16, 64, 64]
+        # Mapper → (pred_z, pred_mean, pred_logvar)
+        pred_z, pred_mean, pred_logvar = mapper(patch_tokens, sample=True)
 
         if debug:
-            print(f"[debug] pred_latents={pred_latents.shape}")
+            print(f"[debug] pred_z={pred_z.shape}, mean={pred_mean.shape}")
 
-        # VAE → gt latents
+        # VAE → gt posterior
         with torch.no_grad():
-            gt_latents = vae.encode(images * 2 - 1)  # [B, 16, 64, 64]
+            gt_mean = vae.encode(images * 2 - 1)  # μ_gt
+            gt_logvar = vae.encode_distribution(images * 2 - 1)[1]  # logvar_gt
 
-        if debug:
-            print(f"[debug] gt_latents={gt_latents.shape}")
+        # MSE: reconstruction loss
+        mse_loss = F.mse_loss(pred_z, gt_mean)
 
-        # Loss & backward
-        loss = F.mse_loss(pred_latents, gt_latents)
+        # KL: distribution alignment
+        kl_loss = kl_divergence(pred_mean, pred_logvar, gt_mean, gt_logvar)
+
+        # Combined loss
+        loss = mse_loss + beta * kl_loss
         loss.backward()
         optimizer.step()
         scheduler.step()
 
         total_loss += loss.item() * images.shape[0]
+        total_mse += mse_loss.item() * images.shape[0]
+        total_kl += kl_loss.item() * images.shape[0]
         n_samples += images.shape[0]
 
         # Log every N steps, and always on step 1
@@ -295,7 +315,8 @@ def train_epoch(
             global_step = epoch * len(loader) + batch_idx + 1
             logger.info(
                 f"  step {global_step:,}  batch={batch_idx + 1}  "
-                f"loss={loss.item():.4f}  lr={optimizer.param_groups[0]['lr']:.6f}"
+                f"loss={loss.item():.4f}  mse={mse_loss.item():.4f}  "
+                f"kl={kl_loss.item():.6f}  lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
     return total_loss / n_samples
@@ -307,6 +328,7 @@ def validate_epoch(
     dino: DINOModel,
     vae: VAEModel,
     device: torch.device,
+    beta: float = 1e-4,
 ) -> float:
     """Run one validation epoch (no_grad). Returns mean loss."""
     mapper.eval()
@@ -318,10 +340,14 @@ def validate_epoch(
             images = images.to(device)
 
             patch_tokens = dino.extract(images)
-            pred_latents = mapper(patch_tokens)
-            gt_latents = vae.encode(images * 2 - 1)
+            # eval: sample=False → pred_z = pred_mean
+            pred_z, pred_mean, pred_logvar = mapper(patch_tokens, sample=False)
+            gt_mean = vae.encode(images * 2 - 1)
+            gt_logvar = vae.encode_distribution(images * 2 - 1)[1]
 
-            loss = F.mse_loss(pred_latents, gt_latents)
+            mse_loss = F.mse_loss(pred_z, gt_mean)
+            kl_loss = kl_divergence(pred_mean, pred_logvar, gt_mean, gt_logvar)
+            loss = mse_loss + beta * kl_loss
             total_loss += loss.item() * images.shape[0]
             n_samples += images.shape[0]
 
@@ -341,39 +367,55 @@ def train_epoch_cached(
     log_freq: int = 100,
     logger: logging.Logger | None = None,
     epoch: int = 0,
+    beta: float = 1e-4,
 ) -> float:
-    """Run one training epoch with cached data (patch_tokens + gt_latents).
+    """Run one training epoch with cached data (patch_tokens + gt_posterior).
 
     Unlike train_epoch(), this does NOT need DINOv3 or VAE - the data is already encoded.
     Only the mapper model is trained, making it ~100x faster per step.
+
+    Loss: MSE_reconstruction + β * KL(mapper_posterior || VAE_posterior)
     """
     mapper.train()
     total_loss = 0.0
+    total_mse = 0.0
+    total_kl = 0.0
     n_samples = 0
 
-    for batch_idx, (patch_tokens, gt_latents) in enumerate(loader):
+    for batch_idx, (patch_tokens, gt_mean, gt_logvar) in enumerate(loader):
         patch_tokens = patch_tokens.to(device)  # [B, 1024, 384]
-        gt_latents = gt_latents.to(device)  # [B, 16, 64, 64]
+        gt_mean = gt_mean.to(device)  # [B, 16, 64, 64]
+        gt_logvar = gt_logvar.to(device)  # [B, 16, 64, 64]
         optimizer.zero_grad()
 
         if debug:
             print(
-                f"[debug] batch {batch_idx}: tokens={patch_tokens.shape}, gt={gt_latents.shape}"
+                f"[debug] batch {batch_idx}: tokens={patch_tokens.shape}, gt_mean={gt_mean.shape}, gt_logvar={gt_logvar.shape}"
             )
 
-        # Mapper → pred latents
-        pred_latents = mapper(patch_tokens)  # [B, 16, 64, 64]
+        # Mapper → (pred_z, pred_mean, pred_logvar)
+        pred_z, pred_mean, pred_logvar = mapper(patch_tokens, sample=True)
 
         if debug:
-            print(f"[debug] pred_latents={pred_latents.shape}")
+            print(
+                f"[debug] pred_z={pred_z.shape}, pred_mean={pred_mean.shape}, pred_logvar={pred_logvar.shape}"
+            )
 
-        # Loss & backward (only mapper parameters)
-        loss = F.mse_loss(pred_latents, gt_latents)
+        # MSE: reconstruction loss
+        mse_loss = F.mse_loss(pred_z, gt_mean)
+
+        # KL: distribution alignment
+        kl_loss = kl_divergence(pred_mean, pred_logvar, gt_mean, gt_logvar)
+
+        # Combined loss
+        loss = mse_loss + beta * kl_loss
         loss.backward()
         optimizer.step()
         scheduler.step()
 
         total_loss += loss.item() * patch_tokens.shape[0]
+        total_mse += mse_loss.item() * patch_tokens.shape[0]
+        total_kl += kl_loss.item() * patch_tokens.shape[0]
         n_samples += patch_tokens.shape[0]
 
         # Log every N steps, and always on step 1
@@ -385,7 +427,8 @@ def train_epoch_cached(
             global_step = epoch * len(loader) + batch_idx + 1
             logger.info(
                 f"  step {global_step:,}  batch={batch_idx + 1}  "
-                f"loss={loss.item():.4f}  lr={optimizer.param_groups[0]['lr']:.6f}"
+                f"loss={loss.item():.4f}  mse={mse_loss.item():.4f}  "
+                f"kl={kl_loss.item():.6f}  lr={optimizer.param_groups[0]['lr']:.6f}"
             )
 
     return total_loss / n_samples
@@ -395,6 +438,7 @@ def validate_epoch_cached(
     mapper: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    beta: float = 1e-4,
 ) -> float:
     """Run one validation epoch with cached data (no_grad)."""
     mapper.eval()
@@ -402,12 +446,15 @@ def validate_epoch_cached(
     n_samples = 0
 
     with torch.no_grad():
-        for patch_tokens, gt_latents in loader:
+        for patch_tokens, gt_mean, gt_logvar in loader:
             patch_tokens = patch_tokens.to(device)
-            gt_latents = gt_latents.to(device)
+            gt_mean = gt_mean.to(device)
+            gt_logvar = gt_logvar.to(device)
 
-            pred_latents = mapper(patch_tokens)
-            loss = F.mse_loss(pred_latents, gt_latents)
+            pred_z, pred_mean, pred_logvar = mapper(patch_tokens, sample=False)
+            mse_loss = F.mse_loss(pred_z, gt_mean)
+            kl_loss = kl_divergence(pred_mean, pred_logvar, gt_mean, gt_logvar)
+            loss = mse_loss + beta * kl_loss
             total_loss += loss.item() * patch_tokens.shape[0]
             n_samples += patch_tokens.shape[0]
 
@@ -571,6 +618,7 @@ def run_training(
                 log_freq=config.log_freq,
                 logger=logger,
                 epoch=epoch,
+                beta=config.beta,
             )
         else:
             train_loss = train_epoch(
@@ -585,6 +633,7 @@ def run_training(
                 log_freq=config.log_freq,
                 logger=logger,
                 epoch=epoch,
+                beta=config.beta,
             )
         logger.info(f"Epoch {epoch + 1}/{config.epochs}  loss={train_loss:.4f}")
 

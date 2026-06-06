@@ -14,7 +14,8 @@ Shard storage format:
     ├── manifest.json              # version, hash, model versions
     ├── shard_00000/
     │   ├── patch_tokens.pt        # [N, 1024, 384] float16
-    │   ├── gt_latents.pt          # [N, 16, 64, 64] float16
+    │   ├── gt_latents.pt          # [N, 16, 64, 64] float16 — mean (μ_gt)
+    │   ├── gt_logvar.pt           # [N, 16, 64, 64] float16 — log-variance (log σ²_gt)
     │   └── meta.json              # image paths, shard info
     └── ...
 
@@ -167,22 +168,31 @@ class ShardCache:
     Designed for per-Dataset-instance use (one per DataLoader worker).
     Automatically evicts the least-recently-used shard when capacity is exceeded.
 
+    Cached data: (tokens, latents, logvars) where logvars may be None
+    for backward compatibility with caches that don't have gt_logvar.pt.
+
     Usage:
         cache = ShardCache(max_shards=8)
-        cache.put(0, tokens, latents)
-        result = cache.get(0)  # → (tokens, latents) or None
+        cache.put(0, tokens, latents, logvars)
+        result = cache.get(0)  # → (tokens, latents, logvars) or None
     """
 
     def __init__(self, max_shards: int = 8):
-        self._cache: OrderedDict[int, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._cache: OrderedDict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = OrderedDict()
         self.max_shards = max_shards
         self.hits = 0
         self.misses = 0
 
-    def get(self, shard_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:  # noqa: ANN201
+    def get(
+        self, shard_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None:  # noqa: ANN201
         """Get cached shard tensors, or None on miss.
 
         On hit, moves entry to end (most recently used).
+        Returns (tokens, latents, logvars) where logvars may be None
+        for backward compatibility with old caches.
         """
         if shard_id in self._cache:
             self._cache.move_to_end(shard_id)
@@ -191,17 +201,25 @@ class ShardCache:
         self.misses += 1
         return None
 
-    def put(self, shard_id: int, tokens: torch.Tensor, latents: torch.Tensor) -> None:
+    def put(
+        self,
+        shard_id: int,
+        tokens: torch.Tensor,
+        latents: torch.Tensor,
+        logvars: torch.Tensor | None = None,
+    ) -> None:
         """Insert shard into cache, evicting LRU if at capacity."""
         if shard_id in self._cache:
             self._cache.move_to_end(shard_id)
 
-        self._cache[shard_id] = (tokens, latents)
+        self._cache[shard_id] = (tokens, latents, logvars)
 
         # Evict LRU entries (at the front)
         while len(self._cache) > self.max_shards:
-            evict_id, (evict_tokens, evict_latents) = self._cache.popitem(last=False)
-            del evict_tokens, evict_latents
+            evict_id, (evict_tokens, evict_latents, evict_logvars) = (
+                self._cache.popitem(last=False)
+            )
+            del evict_tokens, evict_latents, evict_logvars
 
     @property
     def size(self) -> int:
@@ -229,6 +247,9 @@ class CachedDataset(Dataset[Any]):  # noqa: D101
 
     Shuffle is handled by ShardAwareSampler, so __getitem__ is purely
     O(1) lookup + cache check.
+
+    Returns (patch_tokens, gt_mean, gt_logvar) triple.
+    If gt_logvar.pt doesn't exist (old cache), returns zeros for logvar.
 
     Usage:
         config = ShardCacheConfig(cache_dir=Path("cache"))
@@ -299,37 +320,57 @@ class CachedDataset(Dataset[Any]):  # noqa: D101
     def __len__(self) -> int:
         return len(self._index_map)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: D102
-        """Get a single sample (patch_tokens, gt_latents).
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # noqa: D102
+        """Get a single sample (patch_tokens, gt_mean, gt_logvar).
 
         Checks LRU cache first, then loads from disk on miss.
         Returns float32 tensors for training.
+
+        If gt_logvar.pt doesn't exist (backward compat with old cache),
+        returns zeros for the logvar tensor.
         """
         shard_id, offset = self._index_map[idx]
 
         # Cache hit
         cached = self._cache.get(shard_id)
         if cached is not None:
-            tokens, latents = cached
+            tokens, latents, logvars = cached
             tokens = tokens[offset : offset + 1].to(torch.float32)
             latents = latents[offset : offset + 1].to(torch.float32)
-            return tokens, latents
+            if logvars is not None:
+                logvars = logvars[offset : offset + 1].to(torch.float32)
+            else:
+                # Backward compat: old cache without logvar → assume unit variance
+                logvars = torch.zeros(latents.shape, dtype=torch.float32)
+            return tokens, latents, logvars
 
         # Cache miss — load entire shard from HDD
         shard_dir = self.config.cache_dir / f"shard_{shard_id:05d}"
         tokens_path = shard_dir / "patch_tokens.pt"
         latents_path = shard_dir / "gt_latents.pt"
+        logvars_path = shard_dir / "gt_logvar.pt"
 
         tokens = torch.load(tokens_path, weights_only=True).to(torch.float32)
         latents = torch.load(latents_path, weights_only=True).to(torch.float32)
 
+        # Backward compat: logvar file may not exist
+        logvars: torch.Tensor | None
+        if logvars_path.exists():
+            logvars = torch.load(logvars_path, weights_only=True).to(torch.float32)
+        else:
+            logvars = None  # old cache, will be filled with zeros in trainer
+
         # Cache the whole shard for subsequent samples
-        self._cache.put(shard_id, tokens, latents)
+        self._cache.put(shard_id, tokens, latents, logvars)
 
         # Return single sample
         tokens = tokens[offset : offset + 1]
         latents = latents[offset : offset + 1]
-        return tokens, latents
+        if logvars is not None:
+            logvars = logvars[offset : offset + 1]
+        else:
+            logvars = torch.zeros(latents.shape, dtype=torch.float32)
+        return tokens, latents, logvars
 
     @property
     def cache(self) -> ShardCache:
@@ -344,6 +385,130 @@ class CachedDataset(Dataset[Any]):  # noqa: D101
             "shard_count": self.shard_count,
             "shard_size": self.shard_size,
             "cache": self.shard_stats(),
+        }
+
+
+# ── InMemoryDataset ────────────────────────────────────────────────
+
+
+class InMemoryDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    """Fully in-memory dataset for when all shards fit in RAM.
+
+    Specify ``num_shards`` to load that many shards (starting from shard 0)
+    into RAM at construction time.  All shard tensors are concatenated into
+    three large tensors keyed by a flat ``_index_map`` so ``__getitem__``
+    becomes a simple slice — no LRU cache, no shard-aware sampler needed.
+
+    Benefits:
+        * ``__getitem__`` is O(1) tensor indexing (no dict lookups, no disk I/O)
+        * Standard ``DataLoader(shuffle=True)`` works perfectly — no ``ShardAwareSampler``
+        * Complex samplers can be dropped entirely
+
+    Usage::
+
+        config = ShardCacheConfig(cache_dir=Path("~/hdd/cache"))
+        dataset = InMemoryDataset(config, num_shards=32)  # ~32 K samples, ~50 GB
+        loader = DataLoader(dataset, batch_size=32, shuffle=True, pin_memory=True)
+
+    """
+
+    def __init__(
+        self,
+        config: ShardCacheConfig,
+        num_shards: int,
+    ) -> None:
+        self.config = config
+        self.num_shards = num_shards
+
+        # Load manifest to discover shard sizes
+        cache_dir = config.cache_dir
+        manifest = load_manifest(cache_dir)
+        self.shard_count = manifest.total_shards
+
+        # Phase 1: read metadata, build flat index map, count total samples
+        #   _index_map[i] = (shard_id, offset_within_shard)
+        self._index_map: list[tuple[int, int]] = []
+        total_samples = 0
+        for shard_id in range(num_shards):
+            shard_dir = cache_dir / f"shard_{shard_id:05d}"
+            meta_path = shard_dir / "meta.json"
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                n = meta["n_images"]
+                for offset in range(n):
+                    self._index_map.append((shard_id, offset))
+                total_samples += n
+            else:
+                raise FileNotFoundError(
+                    f"Shard {shard_id} not found at {shard_dir} "
+                    f"(manifest says {manifest.total_shards} shards)"
+                )
+
+        self._total_samples = total_samples
+
+        # Phase 2: load all shard tensors into RAM
+        # Stack tensors per modality across shards: [total_samples, ...]
+        # Convert from float16 → float32 during load.
+        tokens_list: list[torch.Tensor] = []
+        latents_list: list[torch.Tensor] = []
+        logvars_list: list[torch.Tensor | None] = []
+
+        for shard_id in range(num_shards):
+            shard_dir = cache_dir / f"shard_{shard_id:05d}"
+            tokens = torch.load(shard_dir / "patch_tokens.pt", weights_only=True).to(
+                torch.float32
+            )
+            latents = torch.load(shard_dir / "gt_latents.pt", weights_only=True).to(
+                torch.float32
+            )
+
+            logvars_path = shard_dir / "gt_logvar.pt"
+            if logvars_path.exists():
+                logvars = torch.load(logvars_path, weights_only=True).to(torch.float32)
+            else:
+                logvars = None  # old cache
+
+            tokens_list.append(tokens)
+            latents_list.append(latents)
+            logvars_list.append(logvars)
+
+        # Concatenate across shards along dimension 0
+        self._tokens: torch.Tensor = torch.cat(tokens_list, dim=0)
+        self._latents: torch.Tensor = torch.cat(latents_list, dim=0)
+        if all(v is not None for v in logvars_list):
+            self._logvars: torch.Tensor = torch.cat(
+                [v for v in logvars_list if v is not None], dim=0
+            )
+        else:
+            # Fallback: fill missing logvars with zeros, then concat
+            resolved: list[torch.Tensor] = []
+            for v in logvars_list:
+                if v is None:
+                    resolved.append(
+                        torch.zeros(latents_list[0].shape, dtype=torch.float32)
+                    )
+                else:
+                    resolved.append(v)
+            self._logvars = torch.cat(resolved, dim=0)
+
+    def __len__(self) -> int:
+        return self._total_samples
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (patch_tokens, gt_mean, gt_logvar) for a single sample."""
+        tokens = self._tokens[idx : idx + 1]  # [1, ...]
+        latents = self._latents[idx : idx + 1]
+        logvars = self._logvars[idx : idx + 1]
+        return tokens, latents, logvars
+
+    @property
+    def info(self) -> dict[str, Any]:
+        return {
+            "mode": "in_memory",
+            "total_samples": self._total_samples,
+            "num_shards": self.num_shards,
+            "tokens_shape": list(self._tokens.shape),
+            "latents_shape": list(self._latents.shape),
         }
 
 

@@ -70,8 +70,13 @@ def _make_cached_dataloaders(
     seed: int = 42,
     subset_size: int | None = None,
     no_val: bool = False,
+    in_memory: bool = False,
 ) -> tuple[Any, Any, Any]:
     """Create train/val DataLoaders from cached shards.
+
+    If ``in_memory`` is True, all shards are loaded into RAM via ``InMemoryDataset``
+    — no ``ShardAwareSampler``, no disk I/O per batch, just pure tensor slicing.
+    (Takes precedence over ``subset_size``.)
 
     If ``no_val`` is True, only a training loader is returned (val is None).
     If ``subset_size`` is given, only the first N samples are loaded.
@@ -84,6 +89,63 @@ def _make_cached_dataloaders(
         max_cached_shards=max_cached_shards,
     )
 
+    if in_memory:
+        # ── In-memory mode: load all shards, simple DataLoader ──
+        # ``num_shards`` is inferred from subset_size (each shard ≈ 1000 samples).
+        from src import InMemoryDataset
+
+        num_shards = (
+            (subset_size + shard_size - 1) // shard_size if subset_size else None
+        )
+
+        if num_shards is None:
+            # No subset → load ALL shards into memory
+            num_shards = load_manifest(cache_dir).total_shards
+
+        dataset = InMemoryDataset(config, num_shards=num_shards)
+
+        def _collate_fn(batch):
+            tokens = torch.stack([b[0].squeeze(0) for b in batch])
+            means = torch.stack([b[1].squeeze(0) for b in batch])
+            logvars = torch.stack([b[2].squeeze(0) for b in batch])
+            return tokens, means, logvars
+
+        train_loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,  # simple shuffle — no sampler needed
+            num_workers=num_workers,
+            drop_last=not no_val,
+            collate_fn=_collate_fn,
+            pin_memory=True,  # faster CPU→GPU transfer
+        )
+
+        if no_val:
+            return train_loader, None, dataset
+
+        # Val: sequential subset of the in-memory dataset
+        # Use a simple SequentialSampler over the first N validation samples
+        from torch.utils.data import SequentialSampler
+
+        val_size = int(len(dataset) * val_ratio) if val_ratio < 1.0 else 0
+        val_dataset = torch.utils.data.Subset(
+            dataset,
+            range(len(dataset) - val_size, len(dataset))
+            if val_size > 0
+            else range(len(dataset)),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+            collate_fn=_collate_fn,
+        )
+
+        return train_loader, val_loader, dataset
+
+    # ── Disk-backed CachedDataset mode (existing) ──
     subset_indices = set(range(subset_size)) if subset_size else None
     dataset = CachedDataset(config, subset_indices=subset_indices)
 
@@ -91,8 +153,9 @@ def _make_cached_dataloaders(
 
     def _collate_fn(batch):
         tokens = torch.stack([b[0].squeeze(0) for b in batch])
-        latents = torch.stack([b[1].squeeze(0) for b in batch])
-        return tokens, latents
+        means = torch.stack([b[1].squeeze(0) for b in batch])
+        logvars = torch.stack([b[2].squeeze(0) for b in batch])
+        return tokens, means, logvars
 
     train_sampler = ShardAwareSampler(
         dataset,
@@ -107,6 +170,7 @@ def _make_cached_dataloaders(
         num_workers=num_workers,
         drop_last=not no_val,
         collate_fn=_collate_fn,
+        pin_memory=True,
     )
 
     if no_val:
@@ -125,6 +189,7 @@ def _make_cached_dataloaders(
         num_workers=0,
         drop_last=False,
         collate_fn=_collate_fn,
+        pin_memory=True,
     )
 
     return train_loader, val_loader, dataset
@@ -165,6 +230,11 @@ def parse_args() -> argparse.Namespace:
         "--no-val",
         action="store_true",
         help="Use all data for training (no train/val split). Useful with small subsets.",
+    )
+    g.add_argument(
+        "--in-memory",
+        action="store_true",
+        help="Load shards into RAM (InMemoryDataset) — no ShardAwareSampler, pure tensor slicing.",
     )
     g.add_argument(
         "--save-freq",
@@ -228,6 +298,12 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--warmup-steps", type=int, default=1000)
     g.add_argument("--log-freq", type=int, default=100, help="Log every N steps")
     g.add_argument(
+        "--beta",
+        type=float,
+        default=1e-4,
+        help="KL divergence weight β (MSE + β*KLD, default: 1e-4)",
+    )
+    g.add_argument(
         "--resume", type=str, default=None, help="Checkpoint path to resume from"
     )
     g.add_argument(
@@ -283,6 +359,7 @@ def main() -> None:
         num_workers=args.num_workers,
         warmup_steps=args.warmup_steps,
         log_freq=args.log_freq,
+        beta=args.beta,
         output_dir=output_dir,
         mapper=args.mapper,
         hidden_channels=args.hidden_channels,
@@ -334,8 +411,9 @@ def main() -> None:
 
             def _collate_fn(batch):
                 tokens = torch.stack([b[0].squeeze(0) for b in batch])
-                latents = torch.stack([b[1].squeeze(0) for b in batch])
-                return tokens, latents
+                means = torch.stack([b[1].squeeze(0) for b in batch])
+                logvars = torch.stack([b[2].squeeze(0) for b in batch])
+                return tokens, means, logvars
 
             # Only build index entries for debug_size items (~1 meta.json read)
             # len() == debug_size, indices [0..debug_size-1] all work
@@ -373,6 +451,7 @@ def main() -> None:
                 seed=42,
                 subset_size=config.subset_size,
                 no_val=config.no_val,
+                in_memory=args.in_memory,
             )
 
         print(f"[train] Dataset: {dataset.info()}")

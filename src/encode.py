@@ -93,8 +93,8 @@ def parse_args() -> argparse.Namespace:
     g.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Encode batch size per step (VRAM-bound; default: 16)",
+        default=32,
+        help="Encode batch size per step (VRAM-bound; default: 32)",
     )
     g.add_argument(
         "--resume",
@@ -114,8 +114,14 @@ def parse_args() -> argparse.Namespace:
     g.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        help="Device to run encoding on (default: cuda)",
+        default="cuda:0",
+        help="Device to run encoding on (default: cuda:0)",
+    )
+    g.add_argument(
+        "--subset",
+        type=str,
+        default=None,
+        help="Only encode specific indices, e.g. '0,32000' for range(0, 32000). Overrides --resume.",
     )
 
     return p.parse_args()
@@ -145,6 +151,7 @@ class BatchShardEncoder:
         # Buffers – start empty (None means "not yet initialized")
         self._buffer_tokens: torch.Tensor | None = None
         self._buffer_latents: torch.Tensor | None = None
+        self._buffer_logvars: torch.Tensor | None = None
         self._buffer_paths: list[str] = []
         self._shard_id: int = 0
 
@@ -159,11 +166,18 @@ class BatchShardEncoder:
     def shard_id(self) -> int:
         return self._shard_id
 
-    def feed(self, tokens: torch.Tensor, latents: torch.Tensor, paths: list[str]):
+    def feed(
+        self,
+        tokens: torch.Tensor,
+        latents: torch.Tensor,
+        logvars: torch.Tensor,
+        paths: list[str],
+    ):
         """Append a batch to the buffer.
 
-        * ``tokens`` shape:  ``[B, 1024, 384]`` (can be on any device)
-        * ``latents`` shape: ``[B, 16, 64, 64]`` (can be on any device)
+        * ``tokens`` shape:  ``[B, 1024, 384]``
+        * ``latents`` shape: ``[B, 16, 64, 64]`` (VAE posterior mean μ)
+        * ``logvars`` shape: ``[B, 16, 64, 64]`` (VAE posterior log-variance)
 
         Tensors are moved to **CPU** immediately via ``.to('cpu')`` so the
         buffer only holds RAM tensors — GPU memory is released before the
@@ -172,18 +186,18 @@ class BatchShardEncoder:
         When the buffer reaches ``shard_size`` the first ``shard_size``
         samples are flushed to disk and removed from the buffer.
         """
-        # .to('cpu') copies to RAM; original GPU tensor is freed when the
-        # caller drops its reference (patch_tokens / gt_latents).
         tokens = tokens.to("cpu", non_blocking=True)
         latents = latents.to("cpu", non_blocking=True)
+        logvars = logvars.to("cpu", non_blocking=True)
 
         if self._buffer_tokens is None:
-            # First batch – initialize buffer tensors
             self._buffer_tokens = tokens
             self._buffer_latents = latents
+            self._buffer_logvars = logvars
         else:
             self._buffer_tokens = torch.cat([self._buffer_tokens, tokens], dim=0)
             self._buffer_latents = torch.cat([self._buffer_latents, latents], dim=0)
+            self._buffer_logvars = torch.cat([self._buffer_logvars, logvars], dim=0)
 
         self._buffer_paths.extend(paths)
 
@@ -201,6 +215,7 @@ class BatchShardEncoder:
         # Slice: first ``shard_size`` samples go to disk, remainder stays.
         tokens = self._buffer_tokens[: self.shard_size].to(torch.float16)
         latents = self._buffer_latents[: self.shard_size].to(torch.float16)
+        logvars = self._buffer_logvars[: self.shard_size].to(torch.float16)
         shard_paths = self._buffer_paths[: self.shard_size]
         n = tokens.shape[0]
 
@@ -210,6 +225,7 @@ class BatchShardEncoder:
 
         torch.save(tokens, shard_dir / "patch_tokens.pt")
         torch.save(latents, shard_dir / "gt_latents.pt")
+        torch.save(logvars, shard_dir / "gt_logvar.pt")
 
         meta = ShardMeta(
             shard_id=self._shard_id,
@@ -239,6 +255,7 @@ class BatchShardEncoder:
             remainder = self.shard_size
             self._buffer_tokens = self._buffer_tokens[remainder:]
             self._buffer_latents = self._buffer_latents[remainder:]
+            self._buffer_logvars = self._buffer_logvars[remainder:]
             self._buffer_paths = self._buffer_paths[remainder:]
         # If buffer was already <= shard_size before slice, remainder is empty.
         # torch.cat on empty would error, so after the above slice the tensors
@@ -274,6 +291,35 @@ def main() -> None:
         print("[encode] ERROR: No images found!")
         sys.exit(1)
 
+    # ── Subset filter ──────────────────────────────────────
+    if args.subset:
+        parts = args.subset.split(",")
+        if len(parts) != 2:
+            print(f"[encode] ERROR: --subset must be 'start,end', got '{args.subset}'")
+            sys.exit(1)
+        try:
+            subset_start, subset_end = int(parts[0]), int(parts[1])
+        except ValueError:
+            print(
+                f"[encode] ERROR: --subset values must be integers, got '{args.subset}'"
+            )
+            sys.exit(1)
+        if subset_start >= subset_end:
+            print(
+                f"[encode] ERROR: --subset start ({subset_start}) must be < end ({subset_end})"
+            )
+            sys.exit(1)
+        if subset_end > total:
+            print(
+                f"[encode] WARNING: --subset end ({subset_end}) exceeds total images ({total}), clamping"
+            )
+            subset_end = total
+        print(
+            f"[encode] Subset: [{subset_start}, {subset_end}) — {subset_end - subset_start:,} images"
+        )
+        paths = paths[subset_start:subset_end]
+        total = len(paths)
+
     # ── Estimate ─────────────────────────────────────────────
     shard_count = (total + args.shard_size - 1) // args.shard_size
     est_cache_gb = (
@@ -297,7 +343,10 @@ def main() -> None:
             if args.resume and manifest:
                 # Check cache validity
                 valid = validate_cache(
-                    cache_dir, paths, args.dino_model, args.vae_model
+                    ShardCacheConfig(cache_dir=cache_dir),
+                    paths,
+                    args.dino_model,
+                    args.vae_model,
                 )
                 if not valid:
                     print("[encode] Cache is INVALID (dataset/model changed)")
@@ -350,49 +399,55 @@ def main() -> None:
     if start_shard > 0:
         encoder._shard_id = start_shard
 
-    # Encode in batches. VAE encode is the VRAM bottleneck —
-    # tune --batch-size to your GPU memory (16 is safe on 12GB).
+    # Encode in batches. DataLoader handles parallel image loading from NAS
+    # (I/O bottleneck). VAE encode is the VRAM bottleneck — tune --batch-size.
     batch_size = args.batch_size
     transform = default_transform()
     dataset = ImageDataset(remaining_paths, transform=transform)
+    num_workers = 16
 
     with torch.no_grad():
-        # tqdm: one batch iteration with overall progress bar
-        batch_count = (len(dataset) + batch_size - 1) // batch_size
+        # DataLoader for parallel image loading (16 workers, I/O parallelism)
+        batch_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        batch_idx = 0
         pbar = tqdm(
-            range(batch_count),
+            batch_loader,
             desc="Encoding",
             unit="batches",
             initial=0,
         )
-        for batch_idx in pbar:
-            i = batch_idx * batch_size
-            batch_tensors = [
-                dataset[j] for j in range(i, min(i + batch_size, len(dataset)))
+        for batch_images in pbar:
+            batch_images = batch_images.to(device)  # [B, 3, 512, 512] in [0, 1]
+
+            # Build path list from remaining_paths using batch index
+            start_sample = batch_idx * batch_size
+            batch_paths_str = [
+                str(remaining_paths[i])
+                for i in range(
+                    start_sample, min(start_sample + batch_size, len(remaining_paths))
+                )
             ]
-
-            if not batch_tensors:
-                continue
-
-            batch_images = torch.stack(batch_tensors).to(
-                device
-            )  # [B, 3, 512, 512] in [0, 1]
+            batch_idx += 1
 
             # DINOv3 → patch tokens
             patch_tokens = dino.extract(batch_images)  # [B, 1024, 384]
 
-            # VAE encode → gt latents
-            gt_latents = vae.encode(batch_images * 2 - 1)  # [B, 16, 64, 64]
+            # VAE encode → full posterior (mean + logvar)
+            gt_mean, gt_logvar = vae.encode_distribution(
+                batch_images * 2 - 1
+            )  # each [B, 16, 64, 64]
 
             # Encode and flush to disk
-            batch_end = min(i + batch_size, len(dataset))
-            batch_paths_str = [str(remaining_paths[j]) for j in range(i, batch_end)]
-            encoder.feed(patch_tokens, gt_latents, batch_paths_str)
+            encoder.feed(patch_tokens, gt_mean, gt_logvar, batch_paths_str)
 
-            # Explicitly drop GPU references — encoder.feed() already
-            # moved the data to CPU, so these are now harmless.
-            del patch_tokens
-            del gt_latents
+            # Explicitly drop GPU references
+            del patch_tokens, gt_mean, gt_logvar
             torch.cuda.empty_cache()
 
             # Update tqdm with shard info
