@@ -5,6 +5,7 @@ from __future__ import annotations
 from src.cache import (
     CachedDataset,
     CacheManifest,
+    InMemoryDataset,
     ShardAwareSampler,
     ShardCache,
     ShardCacheConfig,
@@ -42,6 +43,7 @@ from src.utility import scan_dataset
 __all__ = [
     # cache
     "CachedDataset",
+    "InMemoryDataset",
     "ShardAwareSampler",
     "ShardCache",
     "ShardCacheConfig",
