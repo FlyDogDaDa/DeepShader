@@ -227,8 +227,10 @@ def mock_shard_structure(tmp_path: Path):
         n = 10 if shard_id < 2 else 8  # last shard has 8 images
         tokens = torch.randn(n, 1024, 384, dtype=torch.float16)
         latents = torch.randn(n, 16, 64, 64, dtype=torch.float16)
+        logvars = torch.randn(n, 16, 64, 64, dtype=torch.float16)
         torch.save(tokens, shard_dir / "patch_tokens.pt")
         torch.save(latents, shard_dir / "gt_latents.pt")
+        torch.save(logvars, shard_dir / "gt_logvar.pt")
 
         meta = ShardMeta(shard_id=shard_id, n_images=n)
         with open(shard_dir / "meta.json", "w") as f:
@@ -252,18 +254,20 @@ def test_cached_dataset_shard_count(mock_shard_structure: Path):
 
 
 def test_cached_dataset_getitem_shape(mock_shard_structure: Path):
-    """__getitem__ returns single samples with correct shapes."""
+    """__getitem__ returns (tokens, gt_mean, gt_logvar) with correct shapes."""
     config = ShardCacheConfig(cache_dir=mock_shard_structure)
     dataset = CachedDataset(config)
 
-    tokens, latents = dataset[0]
+    tokens, gt_mean, gt_logvar = dataset[0]
     assert tokens.shape == (1, 1024, 384)
-    assert latents.shape == (1, 16, 64, 64)
+    assert gt_mean.shape == (1, 16, 64, 64)
+    assert gt_logvar.shape == (1, 16, 64, 64)
 
     # Different shard
-    tokens, latents = dataset[15]
+    tokens, gt_mean, gt_logvar = dataset[15]
     assert tokens.shape == (1, 1024, 384)
-    assert latents.shape == (1, 16, 64, 64)
+    assert gt_mean.shape == (1, 16, 64, 64)
+    assert gt_logvar.shape == (1, 16, 64, 64)
 
 
 def test_cached_dataset_getitem_dtype(mock_shard_structure: Path):
@@ -271,9 +275,10 @@ def test_cached_dataset_getitem_dtype(mock_shard_structure: Path):
     config = ShardCacheConfig(cache_dir=mock_shard_structure)
     dataset = CachedDataset(config)
 
-    tokens, latents = dataset[0]
+    tokens, gt_mean, gt_logvar = dataset[0]
     assert tokens.dtype == torch.float32
-    assert latents.dtype == torch.float32
+    assert gt_mean.dtype == torch.float32
+    assert gt_logvar.dtype == torch.float32
 
 
 def test_cached_dataset_cache_hits(mock_shard_structure: Path):
