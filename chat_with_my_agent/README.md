@@ -1,8 +1,8 @@
 # DeepShader Chat History Index
 
 > **專案**：DeepShader — 使用 DINOv3 特徵 + FLUX VAE 解碼的 Anime 圖片生成系統  
-> **時間跨度**：2026-06-02 ~ 2026-06-04（3 天）  
-> **總記錄數**：22 筆（17 agent 筆記 + 5 human 筆記 + 3 script 資料夾）
+> **時間跨度**：2026-06-02 ~ 2026-06-05（4 天）  
+> **總記錄數**：27 筆（20 agent 筆記 + 7 human 筆記 + 3 script 資料夾）
 
 ---
 
@@ -12,8 +12,16 @@
 圖片 → DINOv3 → 特徵 → 輕量映射（Mapper） → FLUX VAE Decoder → 圖片
 ```
 
-**關鍵決策**：跳過 Diffusion/Flow Model，直接將 DINOv3 patch tokens 映射到 FLAX VAE latent space。  
-**需訓練的唯一模型**：`DinoToVAE` mapper（~300K params，遠小於 DINOv3 的 21M）。
+**關鍵決策**：跳過 Diffusion/Flow Model，直接將 DINOv3 patch tokens 映射到 FLUX VAE latent space。
+
+**Mapper 家族**（5 種架構，從 6K 到 2.8M params）：
+| 型號 | Params | 特色 |
+|------|--------|------|
+| `linear` | 6,160 | 純線性投影 |
+| `mlp` | ~302K | 4-layer MLP |
+| `resnet` | ~634K | 32 層殘差塊 |
+| `transformer` | ~390K | 自注意力全局聚合（正在訓練） |
+| `transformer_resnet` | ~2.8M | Transformer + ResNet 混合 |
 
 ---
 
@@ -45,26 +53,31 @@
 | 09 | 06-03 | **架構方向變更**：DINO→VAE 直接映射 | Human | 決定跳過 Diffusion/Flow，改用輕量 mapper + VAE decode |
 | 10 | 06-03 | Full Pipeline PoC 成功 | Agent | `圖片→DINOv3→mapper→VAE→圖片` 端到端通過，mapper 僅 6,160 params |
 | 11 | 06-03 | Mini-batch Training PoC | Agent | 3 epochs × 7 batches 跑完，gradient flow 驗證通過 |
-| 12 | 06-03 | Overfit Experiment：Linear vs MLP | Agent | Linear→loss 1.02/MLP→loss 0.56，MLP 可學但有過曝問題 |
+| 12 | 06-03 | Overfit Experiment：Linear vs MLP | Agent | Linear→loss 1.02 / MLP→loss 0.56，MLP 可學但有過曝問題 |
 | 13 | 06-03 | Training Pipeline Restructure | Agent | 專案重整：`models.py`+`trainer.py`+`train.py`，debug run loss 降 46% |
 
 ### Phase 3：VRAM 優化與兩階段架構（06-04）
 
 | # | 日期 | 標題 | 類型 | 摘要 |
 |---|------|------|------|------|
-| 14 | 06-04 | VRAM Problem Diagnosis | Agent | **關鍵發現**：VAE encode 無 `no_grad` 佔用 93% VRAM。修復後降 87-93% |
+| 14 | 06-04 | VRAM Problem Diagnosis | Agent | **關鍵發現**：VAE encode 無 `no_grad` 佔用 93% VRAM。修復後降 87~93% |
 | 15 | 06-04 | **大重構決定**：Pre-Encode Cache 兩階段 | Human | 每 batch 重跑 DINOv3+VAE.encode = 2870 萬次白費。改為「先編碼→後訓練」 |
 | 16 | 06-04 | Cache 架構設計 | Agent | Shard 存儲格式、LRU cache、**ShardAwareSampler**（hit rate 2.8%→97.2%） |
 | 17 | 06-04 | Cache Pipeline 實作 | Agent | `src/cache.py`+`src/encode.py` 完成，22 tests，resume 機制，float16 存儲 |
 | 18 | 06-04 | Trainer & Train.py 雙模式重構 | Agent | `trainer.py` 自動偵測 cached/image mode，`train.py` CLI 加 `--cache-dir` |
 | 19 | 06-04 | Encode.py Buffer Refactor + Fix | Agent | memory leak 修復、tqdm 進度條、`--batch-size` 參數、`--resume` bug fix |
 
-### Phase 4：Pre-encode 完成與 Cached Training（06-05）
+### Phase 4：Pre-encode 完成與訓練迭代（06-05）
 
 | # | 日期 | 標題 | 類型 | 摘要 |
 |---|------|------|------|------|
-| 20 | 06-05 | Pre-encode 完成 | Agent | **338 shards 全部寫入**，總耗時 7.96h，cache 已就緒可訓練 |
-| 21 | 06-05 | Cached OOM 修復 + ResNet mapper | Agent | `num_workers=16→0` 修復 OOM、ShardAwareSampler train/val split、**DinoToVAE_ResNet**（634K params） |
+| 20 | 06-05 | **Pre-encode 完成** | Agent | 338 shards（~337K images）全部寫入，耗時 7.96 小時。Cached training debug 成功（OOM fix: `num_workers=16→0`） |
+| 21 | 06-05 | Cached OOM 修復 + ResNet Mapper | Agent | 修復 OOM（workers 記憶體耗盡）、ShardAwareSampler train/val split、**DinoToVAE_ResNet**（634K params） |
+| 22 | 06-05 | 移除 Validation + 固定採樣 + 獨立 Decode | Agent | 移除 validation loop、固定 `--sample-indices` 索引、新增 `src/decode.py` CPU 解碼 |
+| 23 | 06-05 | Sample 輸出修正：訓練前存 + 每 epoch 存 | Agent | 訓練前存 epoch=0 基線、每 epoch 結束存檔、格式改為 `sample_*.pt` dict |
+| 24 | 06-05 | Debug mode 優化：只讀 4 個樣本 | Agent | `CachedDataset.subset_indices` 跳過 338 shard meta 讀取、debug 從 40→4 張 |
+| 25 | 06-05 | Decode.py 改版：新格式 → PNG | Agent | 重寫 decode 匹配 `sample_{epoch}.pt` 扁平格式、解碼成 `sample_0000_idx0.png` |
+| 26 | 06-05 | **Transformer Mapper 架構** | Human | ResNet-32 收斂差 → 加入 `DinoToVAE_Transformer`（~390K）+ `TransformerResNet`（~2.8M）。正在訓練 8-layer transformer |
 
 ### 📂 Script 資料夾
 
@@ -83,7 +96,7 @@
 | 組件 | 規格 |
 |------|------|
 | **DINOv3** | ViT-S/16，21M params，hidden=384，patch tokens=1024（512×512 輸入） |
-| **Mapper** | DinoToVAE_Linear(6K) / DinoToVAE_MLP(302K)，輸出 [B, 16, 64, 64] |
+| **Mapper** | Linear(6K) / MLP(302K) / ResNet-32(634K) / Transformer(390K) / TransformerResNet(2.8M) |
 | **FLUX VAE** | AutoencoderKL，downsample=8×，latent=16ch，decode=`x/0.3611+0.1159` |
 | **Dataset** | 337,038 張 512×512 JPG，NAS NFS 儲存 |
 
@@ -91,19 +104,19 @@
 
 ```
 Phase 0: Pre-encode（跑一次，永久共用）
-  Dataset JPG → DINOv3 + VAE.encode → shard cache on disk (~530 GB, 288 shards)
+  Dataset JPG → DINOv3 + VAE.encode → shard cache on disk (~620 GB, 338 shards) ✅ 已完成
 
 Phase 1: Training（每次訓練，毫秒級 batch）
-  shard_reader → unpack tensors → mapper forward/backward（~10ms/step）
+  shard_reader → unpack tensors → mapper forward/backward
 ```
 
 ### Cache 系統
 
 | 組件 | 說明 |
 |------|------|
-| `ShardCache` | LRU cache，8 shards 容量，hit rate ~97% |
+| `ShardCache` | LRU cache，可調容量（預設 8 shards ≈ 10 GB RAM），hit rate ~97% |
 | `ShardAwareSampler` | 兩層 shuffle：shard 順序→shard 內順序 |
-| `CachedDataset` | O(1) index map 查找，自動載入 shard |
+| `CachedDataset` | O(1) index map 查找，自動載入 shard，支援 `subset_indices` debug |
 | `CacheManifest` | 版本控制、dataset hash、模型版本追蹤 |
 | `encode.py` | CLI pre-encode 工具，支援 resume、tqdm、batch-size 調整 |
 
@@ -113,13 +126,13 @@ Phase 1: Training（每次訓練，毫秒級 batch）
 
 | 狀態 | 項目 | 來源 |
 |------|------|------|
-| ✅ | Pre-encode 完成（7.96h，338 shards） | [20](./20_2026_06_05_agent_pre-encode-complete.md) |
+| ✅ | Pre-encode 完成（7.96h, 338 shards） | [20](./20_2026_06_05_agent_pre-encode-complete.md) |
 | ⏳ | 完整 cached training（HDD I/O 慢，可能需數小時） | [20](./20_2026_06_05_agent_pre-encode-complete.md) |
-| ⏳ | 觀察 resnet vs mlp loss 曲線差異 | [21](./21_2026_06_05_agent_cached-oom-fix-and-resnet-mapper.md) |
-| ⏳ | 驗證 `--cache-shards 16` 實際 RAM 用量 | [21](./21_2026_06_05_agent_cached-oom-fix-and-resnet-mapper.md) |
+| ⏳ | ResNet-32 vs Transformer 收斂對比 | [26](./26_2026_06_05_agent_transformer-mapper.md) |
+| ⏳ | Transformer 8-layer GPU 溫度監控（~81°C） | [26](./26_2026_06_05_agent_transformer-mapper.md) |
 | ⏳ | 驗證 image mode backward compat | [18](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |
 | ⏳ | 清理 type warnings（不影響功能） | [18](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |
-| ⏳ | 檢查 decoded 圖片品質 | [10](./10_2026_06_03_agent_full-pipeline-poc-complete.md) |
+| ⏳ | decoded 圖片視覺化品質比對 | [25](./25_2026_06_05_agent_decode-py-reformat.md) |
 
 ---
 
@@ -142,13 +155,18 @@ Phase 1: Training（每次訓練，毫秒級 batch）
 | 12 | 06-03 | `12_agent_overfit-experiment.md` | [↗](./12_2026_06_03_agent_overfit-experiment.md) |
 | 13 | 06-03 | `13_agent_training-pipeline-restructure.md` | [↗](./13_2026_06_03_agent_training-pipeline-restructure.md) |
 | 14 | 06-04 | `14_agent_vram-problem-diagnosis.md` | [↗](./14_2026_06_04_agent_vram-problem-diagnosis.md) |
-| 20 | 06-05 | `20_agent_pre-encode-complete.md` | [↗](./20_2026_06_05_agent_pre-encode-complete.md) |
-| 21 | 06-05 | `21_agent_cached-oom-fix-and-resnet-mapper.md` | [↗](./21_2026_06_05_agent_cached-oom-fix-and-resnet-mapper.md) |
 | 15 | 06-04 | `15_human_pre-encode-cache-pipeline.md` | [↗](./15_2026_06_04_human_pre-encode-cache-pipeline.md) |
 | 16 | 06-04 | `16_agent_cache-architecture-design.md` | [↗](./16_2026_06_04_agent_cache-architecture-design.md) |
 | 17 | 06-04 | `17_agent_cache-pipeline-implementation.md` | [↗](./17_2026_06_04_agent_cache-pipeline-implementation.md) |
 | 18 | 06-04 | `18_agent_trainer-and-train-py-double-mode.md` | [↗](./18_2026_06_04_agent_trainer-and-train-py-double-mode.md) |
 | 19 | 06-04 | `19_agent_encode-py-refactor-and-fix.md` | [↗](./19_2026_06_04_agent_encode-py-refactor-and-fix.md) |
+| 20 | 06-05 | `20_agent_pre-encode-complete.md` | [↗](./20_2026_06_05_agent_pre-encode-complete.md) |
+| 21 | 06-05 | `21_agent_cached-oom-fix-and-resnet-mapper.md` | [↗](./21_2026_06_05_agent_cached-oom-fix-and-resnet-mapper.md) |
+| 22 | 06-05 | `22_agent_validation-removed-and-decode-py.md` | [↗](./22_2026_06_05_agent_validation-removed-and-decode-py.md) |
+| 23 | 06-05 | `23_agent_debug-mode-subsample.md` | [↗](./23_2026_06_05_agent_debug-mode-subsample.md) |
+| 24 | 06-05 | `24_agent_samples-output-fix.md` | [↗](./24_2026_06_05_agent_samples-output-fix.md) |
+| 25 | 06-05 | `25_agent_decode-py-reformat.md` | [↗](./25_2026_06_05_agent_decode-py-reformat.md) |
+| 26 | 06-05 | `26_agent_transformer-mapper.md` | [↗](./26_2026_06_05_agent_transformer-mapper.md) |
 
 ---
 
@@ -156,10 +174,10 @@ Phase 1: Training（每次訓練，毫秒級 batch）
 
 | 指標 | 數值 |
 |------|------|
-| 總筆記數 | 22（17 agent + 5 human） |
+| 總筆記數 | 27（20 agent + 7 human） |
 | 測試覆蓋 | 74 tests passing |
-| Mapper 模型大小 | 6K（Linear）/ 302K（MLP）/ 634K（ResNet） params |
+| Mapper 架構數 | 5 種（Linear / MLP / ResNet / Transformer / TransformerResNet） |
 | Dataset 規模 | 337,038 images × 512×512 × 3 channels |
-| Cache 實際容量 | ~530 GB（338 shards × 1.84 GB）| 已就緒 |
-| Pre-encode 耗時 | 7.96 小時（338 shards）| 已完成 |
-| 預計訓練速度提升 | 從 2870 萬次重複編碼 → 僅讀取 shard I/O |
+| Cache 實際容量 | ~620 GB（338 shards × ~1.84 GB，已完成） |
+| Pre-encode 耗時 | 7.96 小時（28,665s） |
+| 當前訓練 | Transformer 8-layer × batch 64，VRAM ~11GB / 12GB |
