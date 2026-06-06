@@ -71,12 +71,16 @@ def _make_cached_dataloaders(
     subset_size: int | None = None,
     no_val: bool = False,
     in_memory: bool = False,
+    in_memory_shards: int | None = None,
 ) -> tuple[Any, Any, Any]:
     """Create train/val DataLoaders from cached shards.
 
     If ``in_memory`` is True, all shards are loaded into RAM via ``InMemoryDataset``
     — no ``ShardAwareSampler``, no disk I/O per batch, just pure tensor slicing.
     (Takes precedence over ``subset_size``.)
+
+    ``in_memory_shards`` directly specifies how many shards to load into RAM.
+    If not provided, it's inferred from ``subset_size`` (each shard ≈ 1000 samples).
 
     If ``no_val`` is True, only a training loader is returned (val is None).
     If ``subset_size`` is given, only the first N samples are loaded.
@@ -91,23 +95,24 @@ def _make_cached_dataloaders(
 
     if in_memory:
         # ── In-memory mode: load all shards, simple DataLoader ──
-        # ``num_shards`` is inferred from subset_size (each shard ≈ 1000 samples).
         from src import InMemoryDataset
 
-        num_shards = (
-            (subset_size + shard_size - 1) // shard_size if subset_size else None
-        )
-
-        if num_shards is None:
+        # Prefer explicit --in-memory-shards, fall back to inferring from --subset
+        if in_memory_shards is not None:
+            num_shards = in_memory_shards
+        elif subset_size is not None:
+            num_shards = (subset_size + shard_size - 1) // shard_size
+        else:
             # No subset → load ALL shards into memory
             num_shards = load_manifest(cache_dir).total_shards
 
         dataset = InMemoryDataset(config, num_shards=num_shards)
 
         def _collate_fn(batch):
-            tokens = torch.stack([b[0].squeeze(0) for b in batch])
-            means = torch.stack([b[1].squeeze(0) for b in batch])
-            logvars = torch.stack([b[2].squeeze(0) for b in batch])
+            indices = [idx for idx in batch]
+            tokens = dataset._tokens[indices].to(torch.float32)
+            means = dataset._latents[indices].to(torch.float32)
+            logvars = dataset._logvars[indices].to(torch.float32)
             return tokens, means, logvars
 
         train_loader = DataLoader(
@@ -235,6 +240,12 @@ def parse_args() -> argparse.Namespace:
         "--in-memory",
         action="store_true",
         help="Load shards into RAM (InMemoryDataset) — no ShardAwareSampler, pure tensor slicing.",
+    )
+    g.add_argument(
+        "--in-memory-shards",
+        type=int,
+        default=None,
+        help="Number of shards to load into RAM. Overrides --subset for in-memory mode (each shard ≈ 1000 samples).",
     )
     g.add_argument(
         "--save-freq",
@@ -452,6 +463,7 @@ def main() -> None:
                 subset_size=config.subset_size,
                 no_val=config.no_val,
                 in_memory=args.in_memory,
+                in_memory_shards=args.in_memory_shards,
             )
 
         print(f"[train] Dataset: {dataset.info()}")

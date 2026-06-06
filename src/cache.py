@@ -57,6 +57,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import Dataset, Sampler
+from tqdm import tqdm
 
 # ── Data classes ────────────────────────────────────────────────────
 
@@ -425,16 +426,19 @@ class InMemoryDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         manifest = load_manifest(cache_dir)
         self.shard_count = manifest.total_shards
 
-        # Phase 1: read metadata, build flat index map, count total samples
+        # Phase 1: read metadata, build flat index map, track shard counts & logvar presence
         #   _index_map[i] = (shard_id, offset_within_shard)
         self._index_map: list[tuple[int, int]] = []
+        shard_info: list[dict[str, Any]] = []  # {"n": int, "has_logvar": bool}
         total_samples = 0
-        for shard_id in range(num_shards):
+        for shard_id in tqdm(range(num_shards), desc="Building index map"):
             shard_dir = cache_dir / f"shard_{shard_id:05d}"
             meta_path = shard_dir / "meta.json"
             if meta_path.exists():
                 meta = json.loads(meta_path.read_text())
                 n = meta["n_images"]
+                has_logvar = (shard_dir / "gt_logvar.pt").exists()
+                shard_info.append({"n": n, "has_logvar": has_logvar})
                 for offset in range(n):
                     self._index_map.append((shard_id, offset))
                 total_samples += n
@@ -447,49 +451,65 @@ class InMemoryDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         self._total_samples = total_samples
 
         # Phase 2: load all shard tensors into RAM
-        # Stack tensors per modality across shards: [total_samples, ...]
-        # Convert from float16 → float32 during load.
-        tokens_list: list[torch.Tensor] = []
-        latents_list: list[torch.Tensor] = []
-        logvars_list: list[torch.Tensor | None] = []
+        # Keep original dtype (float16) to minimize RAM usage.
+        # Conversion to float32 happens in the collate function per batch.
+        # Pre-allocate tensors then fill in-place to avoid torch.cat doubling memory.
 
-        for shard_id in range(num_shards):
+        # Load first shard to get shape templates (released immediately after)
+        first_shard_dir = cache_dir / "shard_00000"
+        first_tokens = torch.load(
+            first_shard_dir / "patch_tokens.pt", weights_only=True
+        )
+        first_latents = torch.load(first_shard_dir / "gt_latents.pt", weights_only=True)
+        tokens_shape = first_tokens.shape
+        latents_shape = first_latents.shape
+        del first_tokens, first_latents
+
+        # Pre-allocate tensors (float16 — saves 50% RAM vs float32)
+        self._tokens: torch.Tensor = torch.empty(
+            (total_samples, *tokens_shape[1:]), dtype=torch.float16, device="cpu"
+        )
+        self._latents: torch.Tensor = torch.empty(
+            (total_samples, *latents_shape[1:]), dtype=torch.float16, device="cpu"
+        )
+
+        # Pre-allocate logvars with total_samples to keep indexing uniform.
+        # Missing logvar shards get zero-filled (negligible memory: ~32KB).
+        self._logvars: torch.Tensor = torch.zeros(
+            (total_samples, *latents_shape[1:]), dtype=torch.float16, device="cpu"
+        )
+
+        # Fill in-place: load one shard, copy to pre-allocated tensor, delete shard.
+        # Peak memory = final_tensor + one_shard (NOT 2x like torch.cat).
+        idx_offset = 0
+
+        for shard_id in tqdm(range(num_shards), desc="Loading shard tensors"):
             shard_dir = cache_dir / f"shard_{shard_id:05d}"
-            tokens = torch.load(shard_dir / "patch_tokens.pt", weights_only=True).to(
-                torch.float32
-            )
-            latents = torch.load(shard_dir / "gt_latents.pt", weights_only=True).to(
-                torch.float32
-            )
+            n = shard_info[shard_id]["n"]
 
+            tokens = torch.load(
+                shard_dir / "patch_tokens.pt", weights_only=True
+            )  # float16
+            latents = torch.load(
+                shard_dir / "gt_latents.pt", weights_only=True
+            )  # float16
+
+            # In-place copy into pre-allocated buffers
+            self._tokens[idx_offset : idx_offset + n] = tokens
+            self._latents[idx_offset : idx_offset + n] = latents
+
+            # Handle logvars
             logvars_path = shard_dir / "gt_logvar.pt"
             if logvars_path.exists():
-                logvars = torch.load(logvars_path, weights_only=True).to(torch.float32)
-            else:
-                logvars = None  # old cache
+                logvars = torch.load(logvars_path, weights_only=True)  # float16
+                self._logvars[idx_offset : idx_offset + n] = logvars
+                del logvars
 
-            tokens_list.append(tokens)
-            latents_list.append(latents)
-            logvars_list.append(logvars)
+            # Delete shard tensors immediately to free memory
+            del tokens
+            del latents
 
-        # Concatenate across shards along dimension 0
-        self._tokens: torch.Tensor = torch.cat(tokens_list, dim=0)
-        self._latents: torch.Tensor = torch.cat(latents_list, dim=0)
-        if all(v is not None for v in logvars_list):
-            self._logvars: torch.Tensor = torch.cat(
-                [v for v in logvars_list if v is not None], dim=0
-            )
-        else:
-            # Fallback: fill missing logvars with zeros, then concat
-            resolved: list[torch.Tensor] = []
-            for v in logvars_list:
-                if v is None:
-                    resolved.append(
-                        torch.zeros(latents_list[0].shape, dtype=torch.float32)
-                    )
-                else:
-                    resolved.append(v)
-            self._logvars = torch.cat(resolved, dim=0)
+            idx_offset += n
 
     def __len__(self) -> int:
         return self._total_samples
@@ -501,8 +521,8 @@ class InMemoryDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
         logvars = self._logvars[idx : idx + 1]
         return tokens, latents, logvars
 
-    @property
     def info(self) -> dict[str, Any]:
+        """Return dataset metadata (mode, samples, shard count, tensor shapes)."""
         return {
             "mode": "in_memory",
             "total_samples": self._total_samples,

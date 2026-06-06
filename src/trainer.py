@@ -383,9 +383,15 @@ def train_epoch_cached(
     n_samples = 0
 
     for batch_idx, (patch_tokens, gt_mean, gt_logvar) in enumerate(loader):
-        patch_tokens = patch_tokens.to(device)  # [B, 1024, 384]
-        gt_mean = gt_mean.to(device)  # [B, 16, 64, 64]
-        gt_logvar = gt_logvar.to(device)  # [B, 16, 64, 64]
+        patch_tokens = patch_tokens.to(device, non_blocking=True).to(
+            torch.float32
+        )  # [B, 1024, 384]
+        gt_mean = gt_mean.to(device, non_blocking=True).to(
+            torch.float32
+        )  # [B, 16, 64, 64]
+        gt_logvar = gt_logvar.to(device, non_blocking=True).to(
+            torch.float32
+        )  # [B, 16, 64, 64]
         optimizer.zero_grad()
 
         if debug:
@@ -447,9 +453,9 @@ def validate_epoch_cached(
 
     with torch.no_grad():
         for patch_tokens, gt_mean, gt_logvar in loader:
-            patch_tokens = patch_tokens.to(device)
-            gt_mean = gt_mean.to(device)
-            gt_logvar = gt_logvar.to(device)
+            patch_tokens = patch_tokens.to(device, non_blocking=True).to(torch.float32)
+            gt_mean = gt_mean.to(device, non_blocking=True).to(torch.float32)
+            gt_logvar = gt_logvar.to(device, non_blocking=True).to(torch.float32)
 
             pred_z, pred_mean, pred_logvar = mapper(patch_tokens, sample=False)
             mse_loss = F.mse_loss(pred_z, gt_mean)
@@ -588,6 +594,8 @@ def run_training(
             ckpt = load_checkpoint(ckpt_path, mapper, optimizer)
             start_epoch = ckpt["epoch"]
             logger.info(f"Resumed from epoch {start_epoch}")
+            # Restore float32 dtype after resume (checkpoint may have float16 weights)
+            mapper = mapper.to(torch.float32)
 
     logger.info(f"Training: {config.epochs} epochs, {steps_per_epoch} steps/epoch")
     logger.info(f"Checkpoints: {out}/checkpoints/")
