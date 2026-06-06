@@ -68,12 +68,13 @@ def _make_cached_dataloaders(
     shard_size: int = 1000,
     max_cached_shards: int = 8,
     seed: int = 42,
+    subset_size: int | None = None,
+    no_val: bool = False,
 ) -> tuple[Any, Any, Any]:
     """Create train/val DataLoaders from cached shards.
 
-    Uses ``ShardAwareSampler`` for high LRU cache hit rate (~97%):
-    Level 1 — shuffle shard order
-    Level 2 — sequential within each shard
+    If ``no_val`` is True, only a training loader is returned (val is None).
+    If ``subset_size`` is given, only the first N samples are loaded.
     """
     from torch.utils.data import DataLoader
 
@@ -82,41 +83,41 @@ def _make_cached_dataloaders(
         shard_size=shard_size,
         max_cached_shards=max_cached_shards,
     )
-    dataset = CachedDataset(config)
 
-    # ── Train sampler: ShardAwareSampler with epoch-level seed ──────
-    # ShardAwareSampler handles the train/val split internally via
-    # ``train_ratio``, shuffling shard order but keeping sequential
-    # access within shards → ~97% LRU hit rate.
+    subset_indices = set(range(subset_size)) if subset_size else None
+    dataset = CachedDataset(config, subset_indices=subset_indices)
+
     from src import ShardAwareSampler
-
-    train_sampler = ShardAwareSampler(
-        dataset,
-        train_ratio=0.9,
-        seed=seed,
-        is_train=True,
-    )
-    val_sampler = ShardAwareSampler(
-        dataset,
-        train_ratio=0.9,
-        seed=seed,
-        is_train=False,
-    )
 
     def _collate_fn(batch):
         tokens = torch.stack([b[0].squeeze(0) for b in batch])
         latents = torch.stack([b[1].squeeze(0) for b in batch])
         return tokens, latents
 
+    train_sampler = ShardAwareSampler(
+        dataset,
+        train_ratio=0.9 if not no_val else 1.0,
+        seed=seed,
+        is_train=True,
+    )
     train_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=train_sampler,
         num_workers=num_workers,
-        drop_last=True,
+        drop_last=not no_val,
         collate_fn=_collate_fn,
     )
 
+    if no_val:
+        return train_loader, None, dataset
+
+    val_sampler = ShardAwareSampler(
+        dataset,
+        train_ratio=0.9 if not no_val else 1.0,
+        seed=seed,
+        is_train=False,
+    )
     val_loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -153,6 +154,23 @@ def parse_args() -> argparse.Namespace:
         "--no-cache",
         action="store_true",
         help="Force image mode (ignore cache)",
+    )
+    g.add_argument(
+        "--subset",
+        type=int,
+        default=None,
+        help="Limit to first N samples from cache (None=all). Use with --cache-shards to keep all data in RAM.",
+    )
+    g.add_argument(
+        "--no-val",
+        action="store_true",
+        help="Use all data for training (no train/val split). Useful with small subsets.",
+    )
+    g.add_argument(
+        "--save-freq",
+        type=int,
+        default=5,
+        help="Save checkpoint & samples every N epochs (default: 5)",
     )
 
     # ── Data (image mode) ──────────────────────────────────────
@@ -273,6 +291,8 @@ def main() -> None:
         num_transformer_layers=args.num_transformer_layers,
         mlp_ratio=args.mlp_ratio,
         num_resnet_layers=args.num_resnet_layers,
+        subset_size=args.subset,
+        save_every=args.save_freq,
         dataset=str(dataset_root) if not use_cached else str(args.cache_dir),
         sample_indices=sample_indices,
     )
@@ -351,6 +371,8 @@ def main() -> None:
                 shard_size=1000,
                 max_cached_shards=args.cache_shards,
                 seed=42,
+                subset_size=config.subset_size,
+                no_val=config.no_val,
             )
 
         print(f"[train] Dataset: {dataset.info()}")

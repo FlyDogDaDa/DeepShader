@@ -226,3 +226,6 @@ runs/
 # Windows reserved device names
 nul
 NUL
+
+# Notes
+notes.md

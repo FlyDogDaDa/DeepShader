@@ -88,6 +88,9 @@ class TrainingConfig:
     mlp_ratio: float = 4.0
     num_resnet_layers: int = 32
     dataset: str = ""  # dataset path (for reference)
+    subset_size: int | None = None  # limit training to first N samples
+    no_val: bool = False  # use all data for training (no val split)
+    save_every: int = 5  # save checkpoint & samples every N epochs
     sample_indices: list[int] = field(
         default_factory=list
     )  # fixed indices for sampling
@@ -585,8 +588,10 @@ def run_training(
             )
         logger.info(f"Epoch {epoch + 1}/{config.epochs}  loss={train_loss:.4f}")
 
-        # Save samples at fixed indices (no validation loss)
-        if config.sample_indices:
+        save_epoch = (epoch + 1) % config.save_every == 0 or epoch == config.epochs - 1
+
+        # Save samples at fixed indices
+        if config.sample_indices and save_epoch:
             _save_samples_cached(
                 mapper,
                 train_loader.dataset,
@@ -597,7 +602,7 @@ def run_training(
             )
 
         # Checkpoint
-        if config.output_dir:
+        if save_epoch:
             ckpt_dir = out / "checkpoints"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             save_checkpoint(

@@ -22,6 +22,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from dotenv import load_dotenv
 from tqdm import tqdm
 
 from src import load_vae
@@ -76,13 +77,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    load_dotenv()
     torch.backends.cudnn.benchmark = True
 
     vae = load_vae(args.device)
     print(f"[decode] VAE loaded on {args.device}")
 
     # ── Determine input files ──────────────────────────────
-    # Each entry: (sample_path, out_dir, stem, fmt)
+    # Each entry: (sample_path, out_dir, epoch_stem, fmt)
     latents: list[tuple[Path, Path, str, str]] = []
 
     if args.latent:
@@ -115,20 +117,28 @@ def main() -> None:
         return
 
     # ── Decode ─────────────────────────────────────────────
-    # Each entry: (sample_path, out_dir, stem, fmt)
+    # Each entry: (sample_path, out_dir, epoch_stem, fmt)
     # sample_*.pt contains {"idx_0": {pred_latents: ...}, ...}
+    # Output: {out_dir}/idx_{N}/epoch_{epoch}.<fmt> for easy vertical comparison
     decoded = 0
     with torch.no_grad():
-        for sample_path, out_dir, stem, fmt in tqdm(latents, desc="Decoding"):
+        for sample_path, out_dir, epoch_stem, fmt in tqdm(latents, desc="Decoding"):
             data = torch.load(sample_path, map_location=args.device, weights_only=False)
             from torchvision.utils import save_image
 
             for idx_key, item in sorted(data.items()):
                 pred_latents = item["pred_latents"]
                 decoded_img = vae.decode(pred_latents)  # [B, 3, 512, 512]
-                # Parse dataset idx from "idx_0"
+                # Parse idx from "idx_0"
                 idx_num = idx_key.split("_")[1]
-                img_path = out_dir / f"{stem}_idx{idx_num}.{fmt}"
+                # Parse epoch from stem: "sample_0001" → "0001"
+                epoch_num = (
+                    epoch_stem.split("_")[1] if "_" in epoch_stem else epoch_stem
+                )
+                # Create idx subdirectory for vertical comparison
+                idx_dir = out_dir / f"idx_{idx_num}"
+                idx_dir.mkdir(parents=True, exist_ok=True)
+                img_path = idx_dir / f"epoch_{epoch_num}.{fmt}"
                 save_image(
                     decoded_img,
                     img_path,
@@ -137,7 +147,7 @@ def main() -> None:
                 )
                 decoded += 1
 
-    print(f"[decode] Decoded {decoded} images to {out_dir}")
+    print(f"[decode] Decoded {decoded} images to {out_dir}/idx_<N>/")
 
 
 def _resolve_single(
