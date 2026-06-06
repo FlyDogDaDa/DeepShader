@@ -108,12 +108,9 @@ def _make_cached_dataloaders(
 
         dataset = InMemoryDataset(config, num_shards=num_shards)
 
-        def _collate_fn(batch):
-            indices = [idx for idx in batch]
-            tokens = dataset._tokens[indices].to(torch.float32)
-            means = dataset._latents[indices].to(torch.float32)
-            logvars = dataset._logvars[indices].to(torch.float32)
-            return tokens, means, logvars
+        def _collate_fn(batch_items):
+            batchs = zip(*batch_items)  # Transpose batch items
+            return tuple(torch.cat(b).to(torch.float32) for b in batchs)
 
         train_loader = DataLoader(
             dataset,
