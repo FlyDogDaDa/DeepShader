@@ -225,7 +225,9 @@ def _save_samples_cached(
         data = {}
         for idx in indices:
             tokens, gt_mean, gt_logvar = dataset[idx]
-            tokens = tokens.to(device)
+            tokens = tokens.to(device, non_blocking=True).to(torch.float32)
+            gt_mean = gt_mean.to(device, non_blocking=True).to(torch.float32)
+            gt_logvar = gt_logvar.to(device, non_blocking=True).to(torch.float32)
             # eval: sample=False → pred_z = pred_mean
             pred_z, _, _ = mapper(tokens, sample=False)
             data[f"idx_{idx}"] = {
@@ -595,7 +597,7 @@ def run_training(
             start_epoch = ckpt["epoch"]
             logger.info(f"Resumed from epoch {start_epoch}")
             # Restore float32 dtype after resume (checkpoint may have float16 weights)
-            mapper = mapper.to(torch.float32)
+            mapper = mapper.to(device=device, dtype=torch.float32)
 
     logger.info(f"Training: {config.epochs} epochs, {steps_per_epoch} steps/epoch")
     logger.info(f"Checkpoints: {out}/checkpoints/")
